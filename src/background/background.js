@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — Background service worker
+ * Voyage Tools — Background service worker
  *
  * Manages the per-tab "live export is recording" indicator on the action
  * icon. Content scripts (which can't call chrome.action.*) send messages

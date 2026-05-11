@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — getComputedStyle micro-cache (MAIN world)
+ * Voyage Tools — getComputedStyle micro-cache (MAIN world)
  *
  * Wraps window.getComputedStyle to cache its result per element within a
  * single animation frame. The cache is cleared at the start of every frame,

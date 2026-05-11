@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — Settings Controller
+ * Voyage Tools — Settings Controller
  *
  * Bridges the extension popup's chrome.storage settings to the page by
  * setting data-* attributes on <html>. Other content scripts (CSS rules,

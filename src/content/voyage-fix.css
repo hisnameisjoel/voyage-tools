@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — Performance Fix (CSS layer)
+ * Voyage Tools — Performance Fix (CSS layer)
  *
  * Targets message rows in the narrator sidebar chat list and tells the browser
  * to skip layout, style, and paint work for messages that are off-screen.

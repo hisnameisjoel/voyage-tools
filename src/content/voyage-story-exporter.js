@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — Story Exporter (isolated world)
+ * Voyage Tools — Story Exporter (isolated world)
  *
  * Headless on the page — all user-facing UI is in the extension popup. This
  * content script listens for chrome.runtime messages from the popup and

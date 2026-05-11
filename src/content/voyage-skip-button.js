@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — Skip All button (MAIN world)
+ * Voyage Tools — Skip All button (MAIN world)
  *
  * Adds a "Skip All" button inline next to the dialogue's existing
  * "Press space to skip" prompt whenever the dialogue queue is blocking

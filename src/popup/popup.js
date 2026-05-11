@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — Popup script
+ * Voyage Tools — Popup script
  *
  * Wires the feature toggles, exporter config checkboxes, and the Story
  * Export action buttons to chrome.storage.local and the active Voyage tab's

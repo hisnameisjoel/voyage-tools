@@ -1,73 +1,133 @@
-# Voyage Helper
+# Voyage Tools
 
-Tiny Chrome/Chromium extension with quality-of-life tweaks for `beta.voyage.io`. Each feature can be toggled independently from the extension popup.
+Chrome/Chromium extension for `beta.voyage.io` — built around one key feature: **saving your story**.
 
-## Features
+---
 
-1. **Performance fix** — Reduces typing lag in the narrator chat sidebar by ~46% (measured: 74.9 ms → 40.7 ms per keystroke on a 200-message chat). Combines two layered tricks under the hood: `content-visibility: auto` on off-screen messages so the browser skips layout for them, plus a per-animation-frame cache that dedupes the redundant `getComputedStyle` calls Tamagui makes on every keystroke.
-2. **Skip All button** — "⏭ Skip All" button appears next to the "Press space to skip" prompt whenever the dialogue queue is blocking input on a turn. One click skips the entire queue at ~80 ms per segment, getting you to the "What do you do?" prompt without manually pressing space 10–20 times.
-3. **Story exporter** — Save your campaign as markdown. The actions live in the extension popup: download the current in-progress turn, download the whole campaign so far, or "live export" — pick a file once and the extension keeps appending new turns to it as they complete. Output is markdown with five toggleable "include" options (your typed actions, skill checks, status updates, NPC summaries, music cues). Default filenames are derived from the campaign name + character (e.g. `voyage-return_of_the_dragon_queen-jinn.md`), and the extension remembers per-campaign live-export files so reopening the popup in the same room offers Resume.
+## Story Exporter
 
-All three are on by default. Toggle any of them off in the extension popup; changes apply live on open Voyage tabs (no reload needed).
+Voyage doesn't let you export your campaign. Your narration, your choices, the NPC dialogue in the sidebar — it all lives in the browser, and Voyage discards the full NPC conversation text the moment you move to the next turn (replacing it with a brief AI-generated summary). If you close the tab, lose your session, or Voyage has a bad day, your story is gone.
 
-## Install (unpacked)
+**Voyage Tools fixes that.** It captures every turn as it happens and gives you your full campaign as a clean, readable markdown file.
 
-1. Open `chrome://extensions` in Chrome / any Chromium browser.
-2. Toggle **Developer mode** on (top-right).
-3. Click **Load unpacked** and select this folder.
-4. Reload any open `beta.voyage.io` tab.
-5. Click the extension icon in the toolbar to open the popup with toggles.
+### What you can export
 
-## How the perf fix works
+Open the extension popup at any time and choose:
 
-The narrator sidebar mounts every chat message in a non-virtualized list (~200 rows for an active campaign). Each keystroke in the input triggers Tamagui's style cascade, which calls `getComputedStyle` on dozens of styled ancestors and reads the textarea's `scrollHeight` for auto-resize. Because those reads happen after DOM writes from the same React commit, each one forces synchronous layout — and with 200 rows mounted, layout is expensive.
+- **Download current turn** — grab the turn in progress right now, mid-stream if you like
+- **Download whole story** — pulls the entire campaign history and saves it as one markdown file
+- **Live export** — pick a file once; the extension silently appends each new turn to it as it completes. Your story saves itself.
 
-- The CSS layer tells the browser to skip layout/paint for off-screen rows, so each forced reflow only walks visible messages.
-- The cache layer dedupes the redundant `getComputedStyle` reads within a single frame. Tamagui asks for the same theme tokens on the same elements many times per render — values that don't change inside one frame.
+### Live export is the big one
 
-The underlying issue is on Voyage's side (memoization, virtualization, or removing the per-keystroke style reads from the input's `onChange` path) and would need source-side changes to fully fix. This extension is a workaround that gets typing from "noticeably sluggish" toward "tolerable."
+Live export means you never have to remember to save. Pick your file, and from that point on the extension appends each completed turn in the background — even while the extension popup is closed. Open Voyage, play your session, close the tab: the file is already up to date.
 
-## How the Skip button works
+**Per-campaign memory:** the extension remembers which file you picked for each campaign. Reopen the popup in the same room and it offers **Resume** — one click and you're writing to the same file again, picking up exactly where you left off. New turns append; the existing file is never rewritten. A hundred-turn campaign costs a few KB of disk I/O per turn instead of an ever-growing rewrite.
 
-The dialogue queue is fully client-side: pressing space just steps a local index, no network calls. The button dispatches synthetic `KeyboardEvent` keydowns at 80 ms intervals through Voyage's existing handler, which means side effects (focus, audio cleanup, transition to input mode) all fire correctly.
+### NPC conversations, preserved
 
-The button only appears when the "Press space to skip" prompt is actually visible in the viewport. It auto-stops when the prompt disappears or when the visible narrative text stops changing for 3 consecutive presses.
+The big problem with NPC conversations is that the entire chat is **wiped when you advance to the next turn**, replaced by a short summary. The exporter captures your conversations with your NPCs in real time as it streams in. Every line of NPC dialogue in your exported file is the real thing, not the summary.
 
-We did try to find Voyage's queue/index state directly so we could jump to the end without iterating, but it's held in closures inside minified components — not reachable cleanly from outside. Synthetic events through the public input path are more robust anyway: they survive Voyage's internal refactors as long as a spacebar handler exists.
+### Five content toggles
 
-## How the Story exporter works
+Choose exactly what ends up in your file. Toggle each on or off in the popup:
 
-Voyage's game state flows over a Socket.IO websocket connection to `api-beta.aidungeon.com` under the path `/heroes/`. Every turn — both live in-progress turns (streamed in chunks) and historical turns delivered on demand — passes through this socket, with completed turns delivered pre-assembled as `storyParagraphs[]` (one element per dialogue/narration block in the UI). REST endpoints (`/voyage/load-room`, GraphQL `/graphql`) only carry session/metadata, not story content.
+| Toggle | What it includes |
+|---|---|
+| **Your actions** | The text you typed each turn |
+| **Skill checks** | Dice rolls and outcomes |
+| **Status updates** | In-world status/condition changes |
+| **NPC summaries** | The AI-generated summaries Voyage shows after turns |
+| **Music cues** | Scene music and audio direction |
 
-The extension patches `window.WebSocket` at `document_start` in the MAIN world so every WebSocket the page constructs runs through our subclass. When the URL contains `heroes`, we wrap the message listener and parse the Engine.IO + Socket.IO framing (`42[event, payload]`). Captured events:
+### Output
 
-- `joinedRoom` / `usersChanged` / `worldChanged` / `gameStateChanged` — room/world/character/save metadata. The campaign name, character name, save id, and world title come from `gameState.gameConfig` and drive the default filename slug.
-- `narrationStarted` / `narrationSync` — current live turn. Each `narrationSync` carries the cumulative `chunks[]` so far, with rich per-block fields (`type`, `text`, `speaker`, `direction`, `speakerKind`, `imageUrl`, `ttsDescription`). The live-turn formatter renders these at the same fidelity as historical turns.
-- `notifyTurnEnd` / `notifySkillChecksFinished` — fire as a turn completes, each carrying `turnData[]` in the same canonical shape as historical turns. The exporter harvests these directly for append-on-completion live export.
-- `turnHistoryResponse` — bulk historical turns when we send a `requestTurnHistory` frame back. Used for "Whole story" and to backfill on resume.
+Files are standard markdown. Default filenames are derived from your campaign and character — e.g. `voyage-return_of_the_dragon_queen-jinn.md` — so your exports stay organized across multiple campaigns.
 
-For **Whole story**, the exporter sends `requestTurnHistory` in a loop with the `beforeTick` cursor walking backwards (and `count: 10` per batch), until the server signals `hasMore: false`. No clicking "Show Previous Turns" by hand.
+### How the exporter works
 
-For **Live export**, the file is held open via the **File System Access API**. The popup hosts the `showSaveFilePicker` call so it has the user-gesture context it needs; the resulting `FileSystemFileHandle` is shipped to the content script via `chrome.tabs.sendMessage` (FileSystemHandles are structured-cloneable across extension contexts in Chromium 94+) and stored in IndexedDB alongside the highest tick we've already written, keyed by `roomId`. The next page load detects the saved record for the current room and offers "Resume live export…" (Chromium still asks for one read-write permission grant per browser session). New turns are **appended-only** on `notifyTurnEnd` (debounced 500 ms) — the file is never fully rewritten while live export is active, so a 100-turn campaign costs a few KB of disk I/O per turn instead of a full-file rewrite.
+Voyage's story data flows over a Socket.IO websocket to `api-beta.aidungeon.com`. REST and GraphQL endpoints only carry session metadata — the actual story content is websocket-only. The extension patches `window.WebSocket` at page load so every message on the `/heroes/` connection runs through our parser.
 
-The popup polls the content script's `getStatus` every two seconds while open so the displayed turn count, "last written tick", and active/inactive state stay current as new turns land. When the popup is closed, polling stops and the content script keeps the live export running silently.
+Events captured:
 
-## Files
+- `joinedRoom` / `gameStateChanged` — campaign name, character, save ID; drives the default filename slug
+- `narrationSync` — live turn streaming; each frame carries the cumulative chunks so far with full per-block fields (`type`, `text`, `speaker`, `direction`, `speakerKind`)
+- `notifyTurnEnd` / `notifySkillChecksFinished` — fires when a turn completes, carrying the canonical `turnData[]` shape; triggers live-export append
+- `turnHistoryResponse` — bulk history delivered in response to a `requestTurnHistory` frame the extension sends back
 
-- `manifest.json` — Manifest V3, registers content scripts and the popup.
-- `settings-controller.js` — Isolated content script. Reads `chrome.storage.local` and mirrors the user-facing toggles to `<html>` data-attributes. The single "Performance fix" toggle drives both `data-voyage-perf-css` and `data-voyage-gcs-cache` because the two sub-mechanisms always belong together.
-- `voyage-fix.css` — Performance CSS layer, gated by `:root[data-voyage-perf-css="on"]`.
-- `voyage-fix-cache.js` — MAIN-world JS. Wraps `window.getComputedStyle` once at document_start and bypasses the cache when the toggle is off.
-- `voyage-skip-button.js` — MAIN-world JS. Polls for the dialogue prompt, injects/removes the inline Skip All button, dispatches the synthetic spacebars.
-- `voyage-story-cache.js` — MAIN-world JS. Patches `window.WebSocket` at document_start, parses Socket.IO frames on the `/heroes/` connection, maintains the in-memory turn cache, exposes `requestHistory` / `pullAllHistory` / `getSnapshot` to the isolated world via `postMessage`. Always runs (memory cost is small and the cache must be populated by the time the user opens the popup).
-- `voyage-story-exporter.js` — Isolated content script. Headless on the page — listens for `chrome.runtime` messages from the popup and performs the requested action (current turn / whole story / start/resume/stop live export). Formats the cache as markdown according to the popup's "include" toggles, holds the live-export FileSystemFileHandle, persists state to IndexedDB.
-- `popup.html` / `popup.js` — Extension popup UI.
-- `icon-{16,32,48,128}.png` — Toolbar/extension icons.
+For **Whole story**, the exporter walks backwards through history using the `beforeTick` cursor (10 turns per batch) until the server returns `hasMore: false` — no clicking "Show Previous Turns" by hand.
+
+For **Live export**, the file is held open via the **File System Access API**. The popup handles the `showSaveFilePicker` call (it needs a user-gesture context), then ships the `FileSystemFileHandle` to the content script via `chrome.tabs.sendMessage`. The handle and the highest tick already written are stored in IndexedDB, keyed by `roomId`. This is what powers Resume.
+
+The popup polls the content script every two seconds while open, so the displayed turn count and "last written tick" stay live as new turns land.
+
+---
+
+## Additional Features
+
+### Skip All button
+
+When the dialogue queue is blocking input ("Press space to skip"), a **⏭ Skip All** button appears next to the prompt. One click dispatches synthetic spacebar presses at 80 ms intervals through Voyage's existing handler — focus, audio cleanup, and transition to input mode all fire correctly. Stops automatically when the prompt disappears or the visible text stops changing.
+
+The button only shows when the prompt is actually in the viewport. We looked for Voyage's internal queue index (to jump straight to the end) but it's held in closures inside minified components. Synthetic events through the public input path are more robust — they survive internal refactors as long as a spacebar handler exists.
+
+### Performance fix
+
+Reduces typing lag in the narrator sidebar by ~46% (measured: 74.9 ms → 40.7 ms per keystroke on a 200-message chat). Two mechanisms working together:
+
+- **CSS layer** — `content-visibility: auto` on off-screen messages so the browser skips layout/paint for rows not in view
+- **Style cache** — wraps `window.getComputedStyle` to deduplicate the redundant calls Tamagui makes on every keystroke within a single animation frame
+
+The root cause is on Voyage's side (virtualization, memoization, or removing per-keystroke style reads). This is a workaround that gets typing from "noticeably sluggish" toward "tolerable."
+
+---
+
+## Install
+
+Chrome doesn't support installing unpacked extensions from a URL — you need the files on your machine first.
+
+**If you're not a developer:**
+
+1. Go to the [Releases page](https://github.com/hisnameisjoel/voyage-tools/releases/latest) and download the `.zip` file (e.g. `voyage-helper-v1.0.0.zip`)
+2. Unzip it — you'll get a folder named something like `voyage-helper-v1.0.0`
+3. **Move that folder somewhere permanent before loading it.** Chrome links directly to the folder path, so if it moves or gets deleted, the extension breaks. A good spot is `Documents/Extensions/voyage-helper` or anywhere you won't accidentally clean up
+
+**If you use git:**
+
+```
+git clone https://github.com/hisnameisjoel/voyage-tools.git
+```
+
+**Then, in Chrome or any Chromium browser (Chrome, Edge, Brave, Arc):**
+
+1. Open `chrome://extensions`
+2. Toggle **Developer mode** on (top-right corner)
+3. Click **Load unpacked** and select the folder (the one containing `manifest.json` — don't go inside it, select the folder itself)
+4. Reload any open `beta.voyage.io` tab
+5. Click the extension icon in your toolbar to open the popup
+
+All key features are on by default. Toggle any off in the popup; changes apply live on open tabs — no reload needed.
+
+---
 
 ## Caveats
 
-- The Performance fix and Skip All button are workarounds. If Voyage ships real fixes on their end, those features become redundant — turn them off in the popup or uninstall the extension.
-- The Skip All button relies on Voyage's spacebar handler. If they ever add a check for `event.isTrusted`, the button will silently stop advancing. Easy to fix when it happens; let the maintainer know.
-- The CSS rule and the chat row selector depend on Tamagui's atomic class names. If those change in a deploy, the rule simply stops matching and behavior reverts to original.
-- The Story exporter depends on Socket.IO event names (`narrationSync`, `turnHistoryResponse`, `joinedRoom`, etc.) and the historical-turn shape (`storyParagraphs[]`, `playerInputs{}`, `pastUpdates.skillChecks[]`). If Voyage renames or restructures these in a backend change the exporter will break silently — captured `turns` will be empty or formatting will look wrong. Check the browser console for `[voyage-story]` errors first when troubleshooting.
-- Live export uses the File System Access API. Available in Chromium-based browsers (Chrome/Edge/Brave/Arc) but not Firefox/Safari. The picked file's permission grant lasts one browser session — on restart, click the menu item again to re-link.
+- **Story exporter** depends on Socket.IO event names (`narrationSync`, `turnHistoryResponse`, `joinedRoom`, etc.) and the turn shape (`storyParagraphs[]`, `playerInputs{}`, `pastUpdates.skillChecks[]`). If Voyage renames or restructures these in a backend change, the exporter will break silently — captured turns will be empty or formatting will look wrong. Check the browser console for `[voyage-story]` errors first when troubleshooting.
+- **Live export** uses the File System Access API — available in Chromium-based browsers (Chrome, Edge, Brave, Arc) but not Firefox or Safari. The permission grant lasts one browser session; on restart, click Resume in the popup to re-link the file.
+- **Skip All** relies on Voyage's spacebar handler. If they add an `event.isTrusted` check, it will silently stop advancing.
+- **Performance fix and Skip All** are workarounds. If Voyage ships real fixes, those features become redundant — turn them off or uninstall.
+- The CSS rule and chat row selector depend on Tamagui's atomic class names. If those change in a deploy, the rule stops matching and behavior reverts to normal.
+
+---
+
+## Files
+
+- `manifest.json` — Manifest V3, registers content scripts and the popup
+- `settings-controller.js` — Isolated content script; reads `chrome.storage.local` and mirrors toggles to `<html>` data-attributes
+- `voyage-story-cache.js` — MAIN-world JS; patches `window.WebSocket`, parses Socket.IO frames, maintains the in-memory turn cache, exposes `requestHistory` / `pullAllHistory` / `getSnapshot` to the isolated world via `postMessage`
+- `voyage-story-exporter.js` — Isolated content script; listens for popup messages, formats the cache as markdown, manages the live-export `FileSystemFileHandle` and IndexedDB state
+- `popup.html` / `popup.js` — Extension popup UI
+- `voyage-fix.css` — Performance CSS layer, gated by `:root[data-voyage-perf-css="on"]`
+- `voyage-fix-cache.js` — MAIN-world JS; wraps `window.getComputedStyle` for the per-frame dedup cache
+- `voyage-skip-button.js` — MAIN-world JS; polls for the dialogue prompt, injects/removes the Skip All button, dispatches synthetic spacebars
+- `icon-{16,32,48,128}.png` — Toolbar and extension icons

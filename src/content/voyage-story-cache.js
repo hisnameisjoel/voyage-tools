@@ -1,5 +1,5 @@
 /*
- * Voyage Helper — Story Cache (MAIN world)
+ * Voyage Tools — Story Cache (MAIN world)
  *
  * Captures live and historical turn data from the game's Socket.IO connection
  * so the Story Exporter UI can produce a markdown export of the entire

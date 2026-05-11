@@ -1,6 +1,6 @@
 {
   "manifest_version": 3,
-  "name": "Voyage Helper",
+  "name": "Voyage Tools",
   "version": "1.0.0",
   "description": "Quality-of-life tweaks for voyage.io: typing-lag fixes for the narrator chat, a Skip All button for the dialogue queue, and a one-click story exporter that saves your campaign as markdown.",
   "icons": {
@@ -14,7 +14,7 @@
   "host_permissions": ["https://beta.voyage.io/*", "https://alpha.voyage.io/*"],
   "action": {
     "default_popup": "src/popup/popup.html",
-    "default_title": "Voyage Helper",
+    "default_title": "Voyage Tools",
     "default_icon": {
       "16": "src/icons/icon-16.png",
       "32": "src/icons/icon-32.png",
