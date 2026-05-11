@@ -2,7 +2,7 @@
   "manifest_version": 3,
   "name": "Voyage Helper",
   "version": "1.0.0",
-  "description": "Quality-of-life tweaks for beta.voyage.io: typing-lag fixes for the narrator chat, a Skip All button for the dialogue queue, and a one-click story exporter that saves your campaign as markdown.",
+  "description": "Quality-of-life tweaks for voyage.io: typing-lag fixes for the narrator chat, a Skip All button for the dialogue queue, and a one-click story exporter that saves your campaign as markdown.",
   "icons": {
     "16": "src/icons/icon-16.png",
     "32": "src/icons/icon-32.png",
@@ -11,7 +11,7 @@
   },
   "permissions": ["storage"],
   "optional_permissions": ["scripting"],
-  "host_permissions": ["https://beta.voyage.io/*"],
+  "host_permissions": ["https://beta.voyage.io/*", "https://alpha.voyage.io/*"],
   "action": {
     "default_popup": "src/popup/popup.html",
     "default_title": "Voyage Helper",
@@ -26,13 +26,13 @@
   },
   "content_scripts": [
     {
-      "matches": ["https://beta.voyage.io/*"],
+      "matches": ["https://beta.voyage.io/*", "https://alpha.voyage.io/*"],
       "css": ["src/content/voyage-fix.css"],
       "js": ["src/content/settings-controller.js", "src/content/voyage-story-exporter.js"],
       "run_at": "document_start"
     },
     {
-      "matches": ["https://beta.voyage.io/*"],
+      "matches": ["https://beta.voyage.io/*", "https://alpha.voyage.io/*"],
       "js": ["src/content/voyage-fix-cache.js", "src/content/voyage-skip-button.js", "src/content/voyage-story-cache.js"],
       "run_at": "document_start",
       "world": "MAIN"
