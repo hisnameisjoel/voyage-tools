@@ -1,0 +1,56 @@
+name: Release
+
+on:
+  push:
+    tags:
+      - 'v*.*.*'
+
+permissions:
+  contents: write
+
+jobs:
+  release:
+    runs-on: ubuntu-latest
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+
+      - name: Get version from tag
+        id: version
+        run: echo "version=${GITHUB_REF#refs/tags/}" >> $GITHUB_OUTPUT
+
+      - name: Build extension zip
+        run: |
+          RELEASE_NAME="voyage-helper-${{ steps.version.outputs.version }}"
+          mkdir -p "dist/$RELEASE_NAME"
+          cp manifest.json "dist/$RELEASE_NAME/"
+          cp -r src "dist/$RELEASE_NAME/"
+          cd dist
+          zip -r "../$RELEASE_NAME.zip" "$RELEASE_NAME"
+          echo "ZIP created: $RELEASE_NAME.zip"
+
+      - name: Extract changelog entry
+        id: changelog
+        run: |
+          VERSION="${{ steps.version.outputs.version }}"
+          # Strip leading 'v' to match CHANGELOG.md format (e.g. v1.2.0 → 1.2.0)
+          SEMVER="${VERSION#v}"
+          NOTES=$(awk "/^## \[$SEMVER\]/{flag=1; next} /^## \[/{flag=0} flag" CHANGELOG.md)
+          if [ -z "$NOTES" ]; then
+            NOTES="See [CHANGELOG.md](CHANGELOG.md) for details."
+          fi
+          {
+            echo "notes<<EOF"
+            echo "$NOTES"
+            echo "EOF"
+          } >> $GITHUB_OUTPUT
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          name: Voyage Helper ${{ steps.version.outputs.version }}
+          body: ${{ steps.changelog.outputs.notes }}
+          files: voyage-helper-${{ steps.version.outputs.version }}.zip
+          draft: false
+          prerelease: false

@@ -1,0 +1,34 @@
+/*
+ * Voyage Helper — Performance Fix (CSS layer)
+ *
+ * Targets message rows in the narrator sidebar chat list and tells the browser
+ * to skip layout, style, and paint work for messages that are off-screen.
+ *
+ * Why this helps: each keystroke in the "Ask the narrator..." input triggers a
+ * burst of layout-reading calls (getComputedStyle, scrollHeight, etc.) by the
+ * underlying styling layer. With ~200 messages mounted (no virtualization),
+ * those reads force the browser to lay out the entire chat tree on every char.
+ * `content-visibility: auto` lets the browser skip off-screen rows entirely,
+ * cutting per-keystroke frame work substantially.
+ *
+ * Gated by the [data-voyage-perf-css="on"] attribute on <html>, which is set
+ * by settings-controller.js based on the popup toggle. When the toggle is off,
+ * this rule does not apply and the page renders normally.
+ *
+ * Selector targets the chat scroll container's repeating message rows:
+ *   .is_ScrollView                          -- Tamagui scroll view (chat list)
+ *     .is_View                              -- Tamagui View
+ *     ._pos-relative                        -- position: relative
+ *     ._mb-t-space-4                        -- margin-bottom: token "space-4"
+ *     ._fd-row                              -- flex-direction: row
+ *     ._gap-t-space-2                       -- gap: token "space-2"
+ *
+ * If Voyage changes the message-row class signature in a future deploy, the
+ * rule simply stops matching and the page returns to its original behavior.
+ */
+
+:root[data-voyage-perf-css="on"] .is_ScrollView .is_View._pos-relative._mb-t-space-4._fd-row._gap-t-space-2 {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 100px;
+  contain: layout style;
+}

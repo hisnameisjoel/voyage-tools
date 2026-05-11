@@ -1,0 +1,359 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Voyage Tools</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      body {
+        /* Chrome caps popup at 800w × 600h. Width is fixed (popups don't
+           auto-fit content horizontally); height auto-fits up to 600px,
+           then scrolls. Going wider than 320 lets the long labels in the
+           "Include in exports" list fit on one line, which saves ~22px per
+           wrapping checkbox — enough to keep us under the height cap. */
+        width: 400px;
+        margin: 0;
+        padding: 14px 18px 10px;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: #181a20;
+        color: #eaeaea;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 4px;
+      }
+      header img {
+        width: 28px;
+        height: 28px;
+        border-radius: 6px;
+      }
+      h1 {
+        font-size: 15px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: 0.2px;
+      }
+      .subtitle {
+        font-size: 11px;
+        color: #8d909a;
+        margin: 0 0 10px 0;
+      }
+      .toggle-row {
+        display: flex;
+        align-items: center;
+        justify-content: space-between;
+        gap: 12px;
+        padding: 10px 0;
+        border-top: 1px solid #262830;
+      }
+      .toggle-row:first-of-type {
+        border-top: none;
+      }
+      .label {
+        flex: 1;
+        min-width: 0;
+      }
+      .name {
+        font-size: 13px;
+        font-weight: 500;
+        line-height: 1.2;
+      }
+      .desc {
+        font-size: 11px;
+        color: #8d909a;
+        margin-top: 3px;
+        line-height: 1.3;
+      }
+      .switch {
+        position: relative;
+        width: 36px;
+        height: 20px;
+        flex-shrink: 0;
+      }
+      .switch input {
+        opacity: 0;
+        width: 0;
+        height: 0;
+      }
+      .slider {
+        position: absolute;
+        cursor: pointer;
+        inset: 0;
+        background: #3a3d46;
+        border-radius: 20px;
+        transition: background 0.15s ease;
+      }
+      .slider::before {
+        content: "";
+        position: absolute;
+        width: 14px;
+        height: 14px;
+        left: 3px;
+        top: 3px;
+        background: #fff;
+        border-radius: 50%;
+        transition: transform 0.15s ease;
+      }
+      input:checked + .slider {
+        background: #ffd540;
+      }
+      input:checked + .slider::before {
+        transform: translateX(16px);
+      }
+      .story-section {
+        padding: 4px 0 8px 0;
+        border-top: 1px solid #262830;
+        margin-top: 6px;
+      }
+      .story-section[hidden] {
+        display: none;
+      }
+      .section-heading {
+        font-size: 13px;
+        font-weight: 600;
+        color: #eaeaea;
+        margin: 6px 0 4px 0;
+        letter-spacing: 0.2px;
+      }
+      .story-export-row {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 6px;
+      }
+      .story-export-row[hidden] {
+        display: none;
+      }
+      .story-export-label {
+        font-size: 12px;
+        color: #8d909a;
+        flex-shrink: 0;
+      }
+      .story-status {
+        font-size: 12px;
+        color: #c2c5cd;
+        background: #1d1f26;
+        border: 1px solid #262830;
+        border-radius: 5px;
+        padding: 7px 10px;
+        margin: 4px 0 8px 0;
+        line-height: 1.35;
+      }
+      .story-status .session-name {
+        font-weight: 600;
+        color: #eaeaea;
+      }
+      .story-status .session-meta {
+        font-size: 11px;
+        color: #8d909a;
+        margin-top: 2px;
+      }
+      .story-status .live-active {
+        color: #ffd540;
+      }
+      /* Pulsing dot signals "we're actively listening" while live export is
+         on. The polling rebuilds the status card every couple of seconds, so
+         the keyframe duration is tuned to ~match the poll interval — each
+         poll restarts the animation, but at that cadence the cycle is just
+         completing, so the eye reads it as continuous breathing. */
+      .live-pulse {
+        display: inline-block;
+        animation: voyage-pulse 1.8s ease-in-out infinite;
+      }
+      @keyframes voyage-pulse {
+        0%, 100% { opacity: 0.4; }
+        50%      { opacity: 1; }
+      }
+      .story-actions {
+        display: flex;
+        gap: 6px;
+        flex: 1 1 auto;
+        min-width: 0;
+      }
+      .action-btn {
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: 7px 10px;
+        background: #262830;
+        color: #eaeaea;
+        border: 1px solid #3a3d46;
+        border-radius: 5px;
+        font-size: 12px;
+        font-family: inherit;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+      }
+      .action-btn:hover:not(:disabled) {
+        background: #2f323b;
+        border-color: #4a4d56;
+      }
+      .action-btn:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .action-btn.primary {
+        display: block;
+        width: 100%;
+        background: #ffd540;
+        color: #181a20;
+        border-color: #ffd540;
+        font-weight: 600;
+        margin-top: 4px;
+      }
+      .action-btn.primary[hidden] {
+        display: none;
+      }
+      .action-btn.primary:hover:not(:disabled) {
+        background: #ffe066;
+        border-color: #ffe066;
+      }
+      .action-btn.danger {
+        background: #2a2027;
+        border-color: #5a3540;
+        color: #f5b3b3;
+      }
+      .action-btn.danger:hover:not(:disabled) {
+        background: #3a2a30;
+      }
+      .story-tip {
+        font-size: 11px;
+        color: #8d909a;
+        margin: 2px 0 4px 0;
+        line-height: 1.35;
+      }
+      .story-tip[hidden] {
+        display: none;
+      }
+      .story-filepath {
+        font-size: 11px;
+        color: #8d909a;
+        margin: 6px 0 2px 0;
+        line-height: 1.35;
+        word-break: break-all;
+      }
+      .story-filepath[hidden] {
+        display: none;
+      }
+      .story-filepath .filename {
+        color: #c2c5cd;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+      }
+      .config-title {
+        font-size: 13px;
+        font-weight: 600;
+        color: #eaeaea;
+        letter-spacing: 0.2px;
+        margin: 18px 0 4px 0;
+      }
+      .toggles-note {
+        font-size: 11px;
+        color: #6e717a;
+        text-align: center;
+        margin: 10px 0 0 0;
+        padding-top: 10px;
+        border-top: 1px solid #262830;
+        line-height: 1.35;
+      }
+      .config-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 3px 0;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .config-row input[type="checkbox"] {
+        margin: 0;
+        accent-color: #ffd540;
+        flex-shrink: 0;
+      }
+      .config-row .config-label {
+        line-height: 1.3;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <img src="../icons/icon-48.png" alt="" />
+      <h1>Voyage Tools</h1>
+    </header>
+    <p class="subtitle">voyage.io tools and tweaks</p>
+
+    <div class="toggle-row">
+      <div class="label">
+        <div class="name">Performance fix</div>
+        <div class="desc">Reduces typing lag in the narrator chat sidebar</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="perfFix" />
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="toggle-row">
+      <div class="label">
+        <div class="name">Skip All button</div>
+        <div class="desc">One-click to skip the dialogue queue on each turn</div>
+      </div>
+      <label class="switch">
+        <input type="checkbox" id="skipButton" />
+        <span class="slider"></span>
+      </label>
+    </div>
+
+    <div class="story-section" id="storySection" hidden>
+      <div class="section-heading">Story Exporter</div>
+
+      <div class="story-status" id="storyStatus">Loading…</div>
+
+      <div class="story-export-row" id="storyExportRow" hidden>
+        <span class="story-export-label">Export:</span>
+        <div class="story-actions">
+          <button type="button" class="action-btn" id="exportCurrentTurnBtn">Current turn</button>
+          <button type="button" class="action-btn" id="exportWholeStoryBtn">Whole story</button>
+        </div>
+      </div>
+
+      <button type="button" class="action-btn primary" id="liveExportBtn" hidden>Start live export…</button>
+
+      <div class="story-filepath" id="storyFilepath" hidden>Writing to: <span class="filename" id="storyFilename"></span></div>
+      <div class="story-tip" id="storyTip" hidden></div>
+
+      <div class="config-title">Include in exports</div>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeInputs" />
+        <span class="config-label">Your typed actions &amp; dialogue</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeChecks" />
+        <span class="config-label">Skill check rolls and modifiers</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeStatus" />
+        <span class="config-label">Status updates (inventory, level-ups, resources)</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeNpcChats" />
+        <span class="config-label">NPC conversation summaries</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeNpcConversations" />
+        <span class="config-label">Full NPC conversations (live export only — can't be recovered after the turn rolls)</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeMusic" />
+        <span class="config-label">Music &amp; ambience cues</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeMarkers" />
+        <span class="config-label">Live export resume markers (hidden comments needed to resume existing story documents.)</span>
+      </label>
+    </div>
+
+    <script src="popup.js"></script>
+  </body>
+</html>

@@ -1,0 +1,17 @@
+# Build output
+dist/
+
+# Claude Code configuration
+.claude/
+
+# OS files
+.DS_Store
+Thumbs.db
+desktop.ini
+
+# Editor directories
+.vscode/
+.idea/
+
+# Node.js (if build tooling is added later)
+node_modules/
