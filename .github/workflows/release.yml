@@ -22,13 +22,12 @@ jobs:
 
       - name: Build extension zip
         run: |
-          RELEASE_NAME="voyage-tools-${{ steps.version.outputs.version }}"
-          mkdir -p "dist/$RELEASE_NAME"
-          cp manifest.json "dist/$RELEASE_NAME/"
-          cp -r src "dist/$RELEASE_NAME/"
+          mkdir -p "dist/voyage-tools"
+          cp manifest.json "dist/voyage-tools/"
+          cp -r src "dist/voyage-tools/"
           cd dist
-          zip -r "../$RELEASE_NAME.zip" "$RELEASE_NAME"
-          echo "ZIP created: $RELEASE_NAME.zip"
+          zip -r "../voyage-tools-${{ steps.version.outputs.version }}.zip" "voyage-tools"
+          echo "ZIP created: voyage-tools-${{ steps.version.outputs.version }}.zip"
 
       - name: Extract changelog entry
         id: changelog

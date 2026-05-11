@@ -88,9 +88,11 @@ Chrome doesn't support installing unpacked extensions from a URL — you need th
 
 **If you're not a developer:**
 
-1. Go to the [Releases page](https://github.com/hisnameisjoel/voyage-tools/releases/latest) and download the `.zip` file (e.g. `voyage-helper-v1.0.0.zip`)
-2. Unzip it — you'll get a folder named something like `voyage-helper-v1.0.0`
-3. **Move that folder somewhere permanent before loading it.** Chrome links directly to the folder path, so if it moves or gets deleted, the extension breaks. A good spot is `Documents/Extensions/voyage-helper` or anywhere you won't accidentally clean up
+1. Go to the [Releases page](https://github.com/hisnameisjoel/voyage-tools/releases/latest) and download the `.zip` file (e.g. `voyage-tools-v1.0.0.zip`)
+2. Unzip it — you'll get a folder named `voyage-tools`
+3. **Move that folder somewhere permanent before loading it.** Chrome links directly to the folder path, so if it moves or gets deleted, the extension breaks. A good spot is `Documents/Extensions/voyage-tools` or anywhere you won't accidentally clean up
+
+**To update:** download the new zip, unzip it, and overwrite your existing `voyage-tools` folder. Then hit **⟳** (the reload icon) next to the extension on `chrome://extensions` — no need to re-add it.
 
 **If you use git:**
 
