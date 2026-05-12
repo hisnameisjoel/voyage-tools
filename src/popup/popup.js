@@ -184,6 +184,19 @@ function renderStatus(status) {
   // everything continuously, so individual exports would be redundant. Their
   // row position is taken over by the Stop button.
   const liveActive = !!status.liveExport?.active;
+
+  // Markers are required for in-place rewrites (storyRewritten) and reliable
+  // resume. Lock the toggle and explain why while live export is running.
+  const markersEl = document.getElementById('storyIncludeMarkers');
+  if (markersEl) {
+    markersEl.disabled = liveActive;
+    const markersLabel = markersEl.closest('.config-row')?.querySelector('.config-label');
+    if (markersLabel) {
+      markersLabel.textContent = liveActive
+        ? 'Live export resume markers (required while live export is active)'
+        : 'Live export resume markers (hidden comments needed to resume existing story documents.)';
+    }
+  }
   if (els.exportRow) els.exportRow.hidden = liveActive;
   if (els.currentBtn) {
     els.currentBtn.disabled = !status.hasLiveTurn && (status.turnCount || 0) === 0;

@@ -73,6 +73,16 @@
   // to the file. We append-only beyond that. Persisted to IDB alongside the
   // handle so a reload + Resume picks up exactly where we left off.
   let liveExport = null;
+
+  // All file writes (append and rewrite) funnel through this queue so they
+  // never interleave. appendNewTurns and rewriteTurnInFile each fire from
+  // independent debounce timers; without serialization a rewrite read-modify-
+  // write cycle can straddle an append and one write silently obliterates the
+  // other's result.
+  let writeQueue = Promise.resolve();
+  function enqueueWrite(fn) {
+    writeQueue = writeQueue.then(fn).catch(() => {});
+  }
   let storedHandleRoomId = null;    // roomId for which we have a saved handle but aren't actively writing
 
   // ---------- Config: chrome.storage ----------
@@ -145,7 +155,7 @@
       if (e.source !== window) return;
       const m = e.data;
       if (!m || m.source !== NAMESPACE || m.type !== 'change') return;
-      callback(m.event);
+      callback(m.event, m.extra ?? null);
     });
   }
 
@@ -906,7 +916,7 @@
       // Don't include the live in-progress turn in the persistent file —
       // we only commit completed turns. The live turn is for one-off Current
       // turn downloads.
-      const md = buildMarkdown(snap, currentConfig, { includeLive: false });
+      const md = buildMarkdown(snap, { ...currentConfig, storyIncludeMarkers: true }, { includeLive: false });
       await writeToHandle(liveExport.handle, md);
       const lastTick = snap.turns.length ? snap.turns[snap.turns.length - 1].tick : null;
       liveExport.lastWrittenTick = lastTick;
@@ -959,7 +969,7 @@
           && isTurnComplete(t)
       );
       if (newTurns.length === 0) return;
-      const md = buildTurnRangeMarkdown(newTurns, snap, currentConfig, liveExport.writtenChatState);
+      const md = buildTurnRangeMarkdown(newTurns, snap, { ...currentConfig, storyIncludeMarkers: true }, liveExport.writtenChatState);
       await appendToHandle(liveExport.handle, md);
       const newLast = newTurns.reduce((m, t) => Math.max(m, t.tick), cutoff ?? -Infinity);
       liveExport.lastWrittenTick = newLast;
@@ -979,7 +989,7 @@
     // Short debounce coalesces back-to-back turn-completion events
     // (notifySkillChecksFinished often fires right before notifyTurnEnd) into
     // a single append call.
-    liveExport.debounceTimer = setTimeout(appendNewTurns, 500);
+    liveExport.debounceTimer = setTimeout(() => enqueueWrite(appendNewTurns), 500);
   }
 
   // NPC chats are written incrementally to the file as messages stream in —
@@ -991,7 +1001,7 @@
   function scheduleChatFlush() {
     if (!liveExport) return;
     clearTimeout(liveExport.chatDebounceTimer);
-    liveExport.chatDebounceTimer = setTimeout(liveAppendChats, 500);
+    liveExport.chatDebounceTimer = setTimeout(() => enqueueWrite(liveAppendChats), 500);
   }
 
   async function liveAppendChats() {
@@ -1018,6 +1028,82 @@
     }
   }
 
+  // ----- In-place turn rewrite (storyRewritten event) -----
+  // When the narrator rewrites a completed turn, we patch that turn's block in the
+  // live-export file without touching anything outside its heading boundaries.
+  // NPC chats live before the heading they precede, so they're always upstream of
+  // the region we replace and are never affected.
+  const pendingRewriteTicks = new Set();
+  let rewriteDebounceTimer = null;
+
+  function scheduleRewrite(tick) {
+    if (!liveExport) return;
+    pendingRewriteTicks.add(tick);
+    clearTimeout(rewriteDebounceTimer);
+    rewriteDebounceTimer = setTimeout(flushRewrites, 400);
+  }
+
+  function flushRewrites() {
+    if (!liveExport || pendingRewriteTicks.size === 0) return;
+    const ticks = [...pendingRewriteTicks].sort((a, b) => a - b);
+    pendingRewriteTicks.clear();
+    rewriteDebounceTimer = null;
+    for (const tick of ticks) {
+      enqueueWrite(() => rewriteTurnInFile(tick));
+    }
+  }
+
+  async function rewriteTurnInFile(tick) {
+    if (!liveExport) return;
+    try {
+      const snap = await callMain('getSnapshot');
+      if (!liveExport) return;
+      const turn = (snap.turns || []).find((t) => t.tick === tick);
+      if (!turn) return;
+
+      const file = await liveExport.handle.getFile();
+      const content = await file.text();
+
+      // Require the voyage-turn marker to locate the block precisely. If markers
+      // are disabled or the turn hasn't been written yet, the updated storyMessage
+      // stays in cache — a future "Whole story" export will render it correctly.
+      const markerStr = `<!-- voyage-turn:tick=${tick} -->`;
+      const markerIdx = content.indexOf(markerStr);
+      if (markerIdx === -1) return;
+
+      // Scan backward from the marker to find the start of the ## Turn heading.
+      // The heading is always immediately above the marker (no blank line between).
+      const beforeMarker = content.slice(0, markerIdx);
+      const headingNewlineIdx = beforeMarker.lastIndexOf('\n## ');
+      // Keep the \n before the heading as the separator from the prior block.
+      const startIdx = headingNewlineIdx === -1 ? 0 : headingNewlineIdx + 1;
+
+      // Scan forward from the marker end to find the next heading of any level.
+      // \n## matches both ## Turn (level-2) and ### 💬 NPC chat (level-3) headings,
+      // so any chat blocks belonging to the *next* turn are left untouched.
+      const afterMarker = content.slice(markerIdx + markerStr.length);
+      const nextHeadingMatch = afterMarker.match(/\n##/);
+      // +1 to skip the \n so content.slice(endIdx) starts at the '#' of the next heading.
+      const endIdx = nextHeadingMatch
+        ? markerIdx + markerStr.length + nextHeadingMatch.index + 1
+        : content.length;
+
+      const out = [];
+      pushTurn(out, turn, { ...currentConfig, storyIncludeMarkers: true });
+      const newBlock = out.join('\n');
+
+      // content.slice(0, startIdx) ends with '\n\n' (prior block's trailing blank line).
+      // newBlock ends with '\n' (trailing '' element from pushTurn joined with '\n').
+      // The extra '\n' produces '\n\n' before the next heading — matching normal spacing.
+      const newContent = content.slice(0, startIdx) + newBlock + '\n' + content.slice(endIdx);
+      await writeToHandle(liveExport.handle, newContent);
+      setStatus(`Turn ${tick} rewritten in live export.`, 3000);
+    } catch (e) {
+      console.error('[voyage-story] rewriteTurnInFile:', e);
+      setStatus(`Live export rewrite error: ${e.message}`, 5000);
+    }
+  }
+
   // Snapshot the current cache state of all chats into writtenChatState.
   // Called when we've just done a full render (initialWrite) or when we
   // resume into an existing file where chats from prior sessions should
@@ -1038,10 +1124,12 @@
   // The turn and chat paths share writtenChatState so a chat already
   // partially written by liveAppendChats won't be re-rendered when the
   // next turn commits.
-  onMainChange((event) => {
+  onMainChange((event, extra) => {
     if (!liveExport) return;
     if (event === 'joinedRoom') {
       maybeAutoStopOnCampaignSwitch();
+    } else if (event === 'storyRewritten' && typeof extra?.turnTick === 'number') {
+      scheduleRewrite(extra.turnTick);
     } else if (
       event === 'notifyTurnEnd' ||
       event === 'notifySkillChecksFinished' ||

@@ -181,6 +181,7 @@
 
   function dispatchEvent(event, payload) {
     if (!payload || typeof payload !== 'object') return;
+    let changeExtra = null;
     switch (event) {
       case 'joinedRoom': {
         // If we just switched rooms, wipe the per-campaign turn cache so we
@@ -256,6 +257,22 @@
         // don't need for export.
         harvestTurns(payload.turnData);
         break;
+      case 'storyRewritten': {
+        // Narrator-driven rewrite of a completed turn's story body. Payload:
+        //   { turnTick: number, newStoryMessage: string }
+        // newStoryMessage uses the same \n\n-separated format as storyMessage.
+        // We patch both fields so pushTurn renders the new content on next call.
+        const { turnTick, newStoryMessage } = payload;
+        if (typeof turnTick === 'number' && typeof newStoryMessage === 'string') {
+          const turn = cache.turns.get(turnTick);
+          if (turn) {
+            turn.storyMessage = newStoryMessage;
+            turn.storyParagraphs = newStoryMessage.split(/\n{2,}/).map((s) => s.trim()).filter(Boolean);
+          }
+          changeExtra = { turnTick };
+        }
+        break;
+      }
       case 'openNpcChat':
         // Two senders use this event name:
         //   client → server: { npcName, from, currentRoomId } — request
@@ -309,7 +326,7 @@
         }
         break;
     }
-    notifyChange(event);
+    notifyChange(event, changeExtra);
   }
 
   // Player's typed messages travel client→server. Called from the overridden
@@ -487,8 +504,10 @@
   }
 
   // ----- PostMessage bridge to isolated world -----
-  function notifyChange(event) {
-    window.postMessage({ source: NAMESPACE, type: 'change', event }, location.origin);
+  function notifyChange(event, extra) {
+    const msg = { source: NAMESPACE, type: 'change', event };
+    if (extra != null) msg.extra = extra;
+    window.postMessage(msg, location.origin);
   }
 
   window.addEventListener('message', async (e) => {
