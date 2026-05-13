@@ -1099,7 +1099,6 @@
     storedHandleRoomId = snap.roomId;
     rememberFilename(snap.roomId, handle.name);
     notifyBadge(true);
-    setStatus(`Resuming from turn ${parsed.tick}. Catching up…`);
     // Pre-sync cleanup: close any orphan chat blocks in the file (e.g.
     // chats left open by a crashed prior session) before we seed the
     // writtenChatState. Without this, seedWrittenChatStateFromFile would
@@ -1124,6 +1123,7 @@
     const finalSnap = await callMain('getSnapshot');
     const count = finalSnap?.turns?.length || 0;
     syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
+    setStatus('');
     return { ok: true, mode: 'resumed', resumedFromTick: parsed.tick };
   }
 
@@ -1226,7 +1226,6 @@
       if (fileWatermark != null) {
         liveExport.lastWrittenTick = fileWatermark;
         dbg(trace, 'using file watermark', { fileWatermark });
-        setStatus('Live export resumed. Catching up…');
         syncPhase = 'Fetching history…';
         await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
         syncPhase = 'Backfilling characters…';
@@ -1238,6 +1237,7 @@
         const finalSnap = await callMain('getSnapshot');
         const count = finalSnap?.turns?.length || 0;
         syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
+        setStatus('');
         dbg(trace, 'done', { mode: 'watermark-from-file', count });
       } else if (cleaned.trim().length > 0) {
         // File has content but no parseable turn structure. Refusing
@@ -1250,13 +1250,11 @@
         notifyBadge(false);
         return { ok: false, message: 'unrecognizable existing content — refusing to overwrite' };
       } else {
-        setStatus('Live export resumed. Rebuilding file…');
         // syncPhase lifecycle is managed inside initialWrite
         await initialWrite();
       }
     } else {
       dbg(trace, 'using IDB watermark', { recordLastWrittenTick: liveExport.lastWrittenTick });
-      setStatus('Live export resumed. Catching up…');
       syncPhase = 'Fetching history…';
       await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
       syncPhase = 'Backfilling characters…';
@@ -1267,6 +1265,7 @@
       const finalSnap = await callMain('getSnapshot');
       const count = finalSnap?.turns?.length || 0;
       syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
+      setStatus('');
       dbg(trace, 'done', { mode: 'watermark-from-IDB', count });
     }
     return { ok: true };
@@ -1296,6 +1295,7 @@
       await persistLiveExport();
       syncPhase = null;
       syncCompleteMsg = `Sync complete — ${snap.turns.length} turn${snap.turns.length === 1 ? '' : 's'} up to date`;
+      setStatus('');
     } catch (e) {
       syncPhase = null;
       console.error('[voyage-story] initialWrite:', e);
