@@ -1,7 +1,7 @@
 {
   "manifest_version": 3,
   "name": "Voyage Tools",
-  "version": "1.0.2",
+  "version": "1.0.3",
   "description": "Quality-of-life tweaks for voyage.io: typing-lag fixes for the narrator chat, a Skip All button for the dialogue queue, and a one-click story exporter that saves your campaign as markdown.",
   "icons": {
     "16": "src/icons/icon-16.png",
