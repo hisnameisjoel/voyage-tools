@@ -889,14 +889,35 @@
     notifyBadge(true);
     seedWrittenChatState(snap, liveExport.writtenChatState);
 
-    // If we have no record of having written before, this is effectively a
-    // fresh start (e.g., resuming from a pre-1.5.2 install). Do a full
-    // initial write so the header is present and lastWrittenTick is set.
-    // Otherwise, just backfill any turns the page missed while it was closed
-    // and append them.
+    // If we have no record of having written before (e.g. a pre-1.5.2
+    // install), check the file itself before doing a destructive full
+    // overwrite. Live-captured NPC conversations are only in the file —
+    // Voyage wipes full chat text from the server when the next turn
+    // commits — so rebuilding from server state would silently erase them.
+    // If the file already has recognizable Voyage content, use its own
+    // watermark and append-only. Only do a full initialWrite on an empty
+    // or unrecognizable file.
     if (liveExport.lastWrittenTick == null) {
-      setStatus('Live export resumed. Rebuilding file…');
-      await initialWrite();
+      let fileWatermark = null;
+      try {
+        const f = await liveExport.handle.getFile();
+        if (f.size > 0) {
+          const parsed = parseLastTickInFile(await f.text());
+          if (parsed.tick != null) fileWatermark = parsed.tick;
+        }
+      } catch {}
+      if (fileWatermark != null) {
+        liveExport.lastWrittenTick = fileWatermark;
+        setStatus('Live export resumed. Catching up…');
+        await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
+        await appendNewTurns();
+        // appendNewTurns persists only when it actually writes; force a save
+        // so the watermark lands in IDB even if there were no new turns.
+        await persistLiveExport();
+      } else {
+        setStatus('Live export resumed. Rebuilding file…');
+        await initialWrite();
+      }
     } else {
       setStatus('Live export resumed. Catching up…');
       await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
