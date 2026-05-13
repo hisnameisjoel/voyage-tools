@@ -180,6 +180,9 @@ function renderStatus(status) {
   if (status.lastStatus && Date.now() - status.lastStatusAt < 30000) {
     lines.push(makeLine(status.lastStatus, 'session-meta'));
   }
+  if (status.liveExport?.active && status.syncCompleteMsg) {
+    lines.push(makeLine(`✓ ${status.syncCompleteMsg}`, 'session-meta'));
+  }
   setStatusText(lines);
 
   // While live export is active, the one-shot export buttons (Current turn /

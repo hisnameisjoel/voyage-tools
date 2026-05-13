@@ -80,6 +80,9 @@
   // Current phase label shown in the popup status card while a sync is
   // running (resume / start). Null when no sync is in progress.
   let syncPhase = null;
+  // Persistent "Sync complete" line shown in the popup while live export is
+  // active. Set when a resume/start sync finishes; cleared by stopLiveExport.
+  let syncCompleteMsg = null;
 
   // All file writes (append and rewrite) funnel through this queue so they
   // never interleave. appendNewTurns and rewriteTurnInFile each fire from
@@ -114,15 +117,22 @@
   function newTraceId(label) {
     return `${label}#${(++traceCounter).toString(36)}`;
   }
-  // Short summary of a chunk of markdown for log lines — gives us turn-marker
-  // count, chat-marker pairs, total bytes. Avoids dumping full content.
+  // Short summary of a chunk of markdown for log lines and conservation
+  // checks. Counts both the new marker-wrapped chat blocks and the legacy
+  // `### 💬 Conversation with …` headings (which are the only signal in
+  // pre-v1.0.4 files). Any defensive write check should treat *all* of
+  // these as load-bearing — dropping a legacy heading is just as bad as
+  // dropping a marker.
   function summarizeContent(text) {
-    if (typeof text !== 'string') return { bytes: 0, turns: 0, chatStarts: 0, chatEnds: 0 };
+    if (typeof text !== 'string') {
+      return { bytes: 0, turns: 0, chatStarts: 0, chatEnds: 0, legacyChats: 0 };
+    }
     const bytes = text.length;
     const turns = (text.match(/<!--\s*voyage-turn:tick=\d+\s*-->/g) || []).length;
     const chatStarts = (text.match(/<!--\s*voyage-npc-chat:start:/g) || []).length;
     const chatEnds = (text.match(/<!--\s*voyage-npc-chat:end:/g) || []).length;
-    return { bytes, turns, chatStarts, chatEnds };
+    const legacyChats = (text.match(/^### 💬 Conversation with /gm) || []).length;
+    return { bytes, turns, chatStarts, chatEnds, legacyChats };
   }
 
   // ---------- Config: chrome.storage ----------
@@ -1113,7 +1123,7 @@
     syncPhase = null;
     const finalSnap = await callMain('getSnapshot');
     const count = finalSnap?.turns?.length || 0;
-    setStatus(`Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`);
+    syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
     return { ok: true, mode: 'resumed', resumedFromTick: parsed.tick };
   }
 
@@ -1123,6 +1133,7 @@
   async function stopLiveExport(opts = {}) {
     const { preserveRecord = false } = opts;
     syncPhase = null;
+    syncCompleteMsg = null;
     if (liveExport) {
       clearTimeout(liveExport.debounceTimer);
       clearTimeout(liveExport.chatDebounceTimer);
@@ -1226,7 +1237,7 @@
         syncPhase = null;
         const finalSnap = await callMain('getSnapshot');
         const count = finalSnap?.turns?.length || 0;
-        setStatus(`Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`);
+        syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
         dbg(trace, 'done', { mode: 'watermark-from-file', count });
       } else if (cleaned.trim().length > 0) {
         // File has content but no parseable turn structure. Refusing
@@ -1255,7 +1266,7 @@
       syncPhase = null;
       const finalSnap = await callMain('getSnapshot');
       const count = finalSnap?.turns?.length || 0;
-      setStatus(`Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`);
+      syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
       dbg(trace, 'done', { mode: 'watermark-from-IDB', count });
     }
     return { ok: true };
@@ -1284,7 +1295,7 @@
       seedWrittenChatStateFromCache(snap, liveExport.writtenChatState);
       await persistLiveExport();
       syncPhase = null;
-      setStatus(`Sync complete — ${snap.turns.length} turn${snap.turns.length === 1 ? '' : 's'} up to date`);
+      syncCompleteMsg = `Sync complete — ${snap.turns.length} turn${snap.turns.length === 1 ? '' : 's'} up to date`;
     } catch (e) {
       syncPhase = null;
       console.error('[voyage-story] initialWrite:', e);
@@ -1448,9 +1459,10 @@
       if (
         outSummary.turns < inSummary.turns ||
         outSummary.chatStarts < inSummary.chatStarts ||
-        outSummary.chatEnds < inSummary.chatEnds
+        outSummary.chatEnds < inSummary.chatEnds ||
+        outSummary.legacyChats < inSummary.legacyChats
       ) {
-        console.error('[voyage-story] backfillCharactersInFile: refusing to write — would drop markers', {
+        console.error('[voyage-story] backfillCharactersInFile: refusing to write — would drop markers or chat headings', {
           inSummary, outSummary,
         });
         dbg(trace, 'abort:would-drop-markers', { inSummary, outSummary });
@@ -1610,9 +1622,10 @@
       if (
         outSummary.turns < inSummary.turns ||
         outSummary.chatStarts < inSummary.chatStarts ||
-        outSummary.chatEnds < inSummary.chatEnds
+        outSummary.chatEnds < inSummary.chatEnds ||
+        outSummary.legacyChats < inSummary.legacyChats
       ) {
-        console.error('[voyage-story] rewriteTurnInFile: refusing to write — would drop markers', {
+        console.error('[voyage-story] rewriteTurnInFile: refusing to write — would drop markers or chat headings', {
           tick, inSummary, outSummary, startIdx, endIdx,
         });
         return;
@@ -1768,9 +1781,10 @@
     if (
       outSummary.turns < inSummary.turns ||
       outSummary.chatStarts < inSummary.chatStarts ||
-      outSummary.chatEnds < inSummary.chatEnds
+      outSummary.chatEnds < inSummary.chatEnds ||
+      outSummary.legacyChats < inSummary.legacyChats
     ) {
-      console.error('[voyage-story] preSyncCleanupChatBlocks: refusing to commit — would drop markers', {
+      console.error('[voyage-story] preSyncCleanupChatBlocks: refusing to commit — would drop markers or chat headings', {
         inSummary, outSummary,
       });
       dbg(trace, 'abort:would-drop-markers', { inSummary, outSummary, orphanDecisions });
@@ -1926,6 +1940,7 @@
       hasStoredHandle,
       suggestedFilename,
       syncPhase,
+      syncCompleteMsg,
       lastStatus: lastStatusMessage,
       lastStatusAt,
       filePickerSupported: typeof window.showSaveFilePicker === 'function',
