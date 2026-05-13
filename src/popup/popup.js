@@ -164,7 +164,9 @@ function renderStatus(status) {
   lines.push(makeLine(title, 'session-name'));
 
   const metaParts = [];
-  if (status.loadingHistory) {
+  if (status.syncPhase) {
+    metaParts.push(status.syncPhase);
+  } else if (status.loadingHistory) {
     metaParts.push('loading history…');
   } else if (typeof status.turnCount === 'number') {
     const total = status.turnCount + (status.hasLiveTurn ? 1 : 0);

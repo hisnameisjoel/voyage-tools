@@ -5,6 +5,16 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.5] - 2026-05-13
+
+### Added
+- Sync progress display in the popup: the status card now shows the current sync phase ("Cleaning up interrupted chats…", "Fetching history…", "Backfilling characters…", "Writing missing turns…") in place of the turn count while a resume or start sync is running, then shows "Sync complete — N turns up to date" when done
+- Verbose debug logging for live-export internals, gated behind `chrome.storage.local.voyageStoryDebug`. Enable from the Voyage tab's DevTools console with `__voyageStoryHelper.setDebug(true)`; disable with `setDebug(false)`. Logs prefix every line with `[voyage-story]` and trace every file read, write, cleanup decision, backfill insertion, append, and rewrite.
+- `__voyageStoryHelper.dumpState()` debug handle — returns the current liveExport state, parsed file chat blocks, and cache snapshot summary in one object. Run from the Voyage tab's DevTools console (`await __voyageStoryHelper.dumpState()`).
+
+### Fixed
+- `backfillCharactersInFile`, `preSyncCleanupChatBlocks`, and `rewriteTurnInFile` now refuse to commit a write if the new content has fewer turn markers, NPC-chat-start markers, or NPC-chat-end markers than the input. Any slicing bug that would silently drop a chat block is now caught and logged instead of overwriting the file.
+
 ## [1.0.4] - 2026-05-13
 
 ### Added

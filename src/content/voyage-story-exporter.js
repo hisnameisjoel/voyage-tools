@@ -77,6 +77,9 @@
   // to the file. We append-only beyond that. Persisted to IDB alongside the
   // handle so a reload + Resume picks up exactly where we left off.
   let liveExport = null;
+  // Current phase label shown in the popup status card while a sync is
+  // running (resume / start). Null when no sync is in progress.
+  let syncPhase = null;
 
   // All file writes (append and rewrite) funnel through this queue so they
   // never interleave. appendNewTurns and rewriteTurnInFile each fire from
@@ -89,12 +92,51 @@
   }
   let storedHandleRoomId = null;    // roomId for which we have a saved handle but aren't actively writing
 
+  // ---------- Verbose debug logging ----------
+  // Off by default. Toggle by setting `voyageStoryDebug: true` in
+  // chrome.storage.local (Voyage tab DevTools → Application → Storage →
+  // Local Storage isn't where chrome.storage lives — easiest enable is
+  // running `chrome.storage.local.set({ voyageStoryDebug: true })` from
+  // the popup's DevTools console, or by calling
+  // `window.__voyageStoryHelper.setDebug(true)` from the Voyage tab's
+  // console). When on, every file read/write, every cleanup decision,
+  // every backfill insertion, and every append goes through dbg() with
+  // a fixed `[voyage-story]` prefix so the Voyage tab's DevTools console
+  // can be filtered down to the live-export trace.
+  let DEBUG_LOG = false;
+  function dbg(...args) {
+    if (!DEBUG_LOG) return;
+    try { console.log('[voyage-story]', ...args); } catch {}
+  }
+  // Trace-id helper — every high-level operation gets a short label so
+  // interleaved logs stay correlatable across async hops.
+  let traceCounter = 0;
+  function newTraceId(label) {
+    return `${label}#${(++traceCounter).toString(36)}`;
+  }
+  // Short summary of a chunk of markdown for log lines — gives us turn-marker
+  // count, chat-marker pairs, total bytes. Avoids dumping full content.
+  function summarizeContent(text) {
+    if (typeof text !== 'string') return { bytes: 0, turns: 0, chatStarts: 0, chatEnds: 0 };
+    const bytes = text.length;
+    const turns = (text.match(/<!--\s*voyage-turn:tick=\d+\s*-->/g) || []).length;
+    const chatStarts = (text.match(/<!--\s*voyage-npc-chat:start:/g) || []).length;
+    const chatEnds = (text.match(/<!--\s*voyage-npc-chat:end:/g) || []).length;
+    return { bytes, turns, chatStarts, chatEnds };
+  }
+
   // ---------- Config: chrome.storage ----------
   function loadConfig() {
     return new Promise((resolve) => {
-      chrome.storage.local.get(CONFIG_KEYS, (result) => {
+      chrome.storage.local.get([...CONFIG_KEYS, 'voyageStoryDebug'], (result) => {
         for (const k of CONFIG_KEYS) {
           if (typeof result[k] === 'boolean') currentConfig[k] = result[k];
+        }
+        if (typeof result.voyageStoryDebug === 'boolean') {
+          DEBUG_LOG = result.voyageStoryDebug;
+          if (DEBUG_LOG) {
+            try { console.log('[voyage-story] verbose debug logging enabled'); } catch {}
+          }
         }
         resolve();
       });
@@ -107,6 +149,11 @@
         const v = changes[k].newValue;
         currentConfig[k] = typeof v === 'boolean' ? v : DEFAULT_CONFIG[k];
       }
+    }
+    if ('voyageStoryDebug' in changes) {
+      const v = changes.voyageStoryDebug.newValue;
+      DEBUG_LOG = typeof v === 'boolean' ? v : false;
+      try { console.log('[voyage-story] verbose debug logging', DEBUG_LOG ? 'enabled' : 'disabled'); } catch {}
     }
     // Config changes don't retroactively re-render the live-export file —
     // already-appended turns keep whatever formatting they had when written.
@@ -253,14 +300,25 @@
     if ((await handle.queryPermission(opts)) === 'granted') return true;
     return (await handle.requestPermission(opts)) === 'granted';
   }
-  async function writeToHandle(handle, content) {
+  async function writeToHandle(handle, content, _caller) {
     // Full overwrite. Used for the initial write of a live-export file and
     // for one-shot downloads.
+    if (DEBUG_LOG) {
+      let preSize = null;
+      try { preSize = (await handle.getFile()).size; } catch {}
+      dbg('writeToHandle:start', {
+        caller: _caller || '<unknown>',
+        preBytes: preSize,
+        newBytes: content?.length || 0,
+        summary: summarizeContent(content),
+      });
+    }
     const writable = await handle.createWritable();
     await writable.write(content);
     await writable.close();
+    dbg('writeToHandle:done', { caller: _caller || '<unknown>' });
   }
-  async function appendToHandle(handle, content) {
+  async function appendToHandle(handle, content, _caller) {
     // Append-only write. Uses keepExistingData so the file's prior contents
     // are preserved, then seeks to the end and writes. If the user edited
     // the file outside the extension, our append simply goes after whatever
@@ -281,6 +339,12 @@
     await writable.seek(file.size);
     await writable.write(prefix + content);
     await writable.close();
+    dbg('appendToHandle:done', {
+      caller: _caller || '<unknown>',
+      preBytes: file.size,
+      appendedBytes: (prefix + content).length,
+      summary: summarizeContent(content),
+    });
   }
   async function persistLiveExport() {
     if (!liveExport) return;
@@ -952,13 +1016,12 @@
   //     state for a failed start, so the popup can't show "active" while
   //     writes are failing.
   async function startLiveExport(handle) {
+    const trace = newTraceId('start');
+    dbg(trace, 'start', { filename: handle?.name });
     if (!handle) {
       setStatus('Internal error: no file handle.');
       return { ok: false, message: 'no handle' };
     }
-    // Sanity check: the handle should arrive via structured clone with its
-    // FileSystemFileHandle methods intact. If not, every subsequent write
-    // would fail with a confusing TypeError — bail up front.
     if (typeof handle.createWritable !== 'function' || typeof handle.getFile !== 'function') {
       setStatus('Internal error: the file handle is missing its methods. Reload the Voyage tab and try again.');
       return { ok: false, message: 'handle methods missing' };
@@ -966,17 +1029,17 @@
     const snap = await callMain('getSnapshot');
     if (!snap.roomId) {
       setStatus('Wait for the room to finish loading before starting live export.');
+      dbg(trace, 'abort', { reason: 'no roomId' });
       return { ok: false, message: 'room not ready' };
     }
-
-    // Read existing content. If this fails we abort — we never want to
-    // overwrite a file we couldn't first read, even if Chrome would let us.
     let existing;
     try {
       const f = await handle.getFile();
       existing = await f.text();
+      dbg(trace, 'file read', { bytes: f.size, summary: summarizeContent(existing) });
     } catch (e) {
       setStatus(`Couldn't read the picked file: ${e.message || e.name || 'unknown error'}. Pick a different file.`);
+      dbg(trace, 'abort', { reason: 'file read failed', message: e?.message });
       return { ok: false, message: 'read failed: ' + (e.message || e.name) };
     }
 
@@ -1032,17 +1095,25 @@
     // writtenChatState. Without this, seedWrittenChatStateFromFile would
     // see only the half-written orphan and the live writer could end up
     // emitting duplicate content past it.
+    syncPhase = 'Cleaning up interrupted chats…';
     const { content: cleaned } = await preSyncCleanupChatBlocks(existing, snap);
     if (cleaned !== existing) {
-      await writeToHandle(handle, cleaned);
+      await writeToHandle(handle, cleaned, 'startLiveExport:preSyncCleanup');
     }
     seedWrittenChatStateFromFile(cleaned, snap, liveExport.writtenChatState);
+    syncPhase = 'Fetching history…';
     await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
+    syncPhase = 'Backfilling characters…';
     await backfillCharactersInFile();
+    syncPhase = 'Writing missing turns…';
     await appendNewTurns();
     // appendNewTurns persists only when it actually wrote something; make
     // sure the handle + tick land in IDB even if there was nothing new.
     await persistLiveExport();
+    syncPhase = null;
+    const finalSnap = await callMain('getSnapshot');
+    const count = finalSnap?.turns?.length || 0;
+    setStatus(`Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`);
     return { ok: true, mode: 'resumed', resumedFromTick: parsed.tick };
   }
 
@@ -1051,6 +1122,7 @@
   // Used by the auto-stop-on-campaign-switch path; manual stops clear it.
   async function stopLiveExport(opts = {}) {
     const { preserveRecord = false } = opts;
+    syncPhase = null;
     if (liveExport) {
       clearTimeout(liveExport.debounceTimer);
       clearTimeout(liveExport.chatDebounceTimer);
@@ -1067,18 +1139,30 @@
   }
 
   async function resumeLiveExport() {
+    const trace = newTraceId('resume');
+    dbg(trace, 'start');
     const snap = await callMain('getSnapshot');
     if (!snap.roomId) {
       setStatus('Wait for the room to finish loading.');
+      dbg(trace, 'abort', { reason: 'no roomId in snapshot' });
       return { ok: false, message: 'room not ready' };
     }
     const record = await loadRecord(snap.roomId);
     if (!record) {
+      dbg(trace, 'abort', { reason: 'no IDB record for room', roomId: snap.roomId });
       return { ok: false, message: 'no stored handle for this room — pick a file first' };
     }
+    dbg(trace, 'record loaded', {
+      roomId: snap.roomId,
+      recordLastWrittenTick: record.lastWrittenTick,
+      filename: record.handle?.name,
+      snapTurns: (snap.turns || []).length,
+      snapNpcChats: (snap.npcChats || []).length,
+    });
     const ok = await ensureHandlePermission(record.handle);
     if (!ok) {
       setStatus('Permission denied for the saved file.');
+      dbg(trace, 'abort', { reason: 'permission denied' });
       return { ok: false, message: 'permission denied' };
     }
     liveExport = {
@@ -1106,14 +1190,19 @@
     try {
       const f = await liveExport.handle.getFile();
       if (f.size > 0) existing = await f.text();
-    } catch {}
+      dbg(trace, 'file read', { bytes: f.size, summary: summarizeContent(existing) });
+    } catch (e) {
+      dbg(trace, 'file read failed', { message: e?.message });
+    }
 
+    syncPhase = 'Cleaning up interrupted chats…';
     const { content: cleaned, dirty } = await preSyncCleanupChatBlocks(existing, snap);
     if (dirty) {
-      try { await writeToHandle(liveExport.handle, cleaned); }
+      try { await writeToHandle(liveExport.handle, cleaned, 'resumeLiveExport:preSyncCleanup'); }
       catch (e) { console.warn('[voyage-story] preSyncCleanup write failed:', e); }
     }
     seedWrittenChatStateFromFile(cleaned, snap, liveExport.writtenChatState);
+    dbg(trace, 'seeded writtenChatState', { entries: liveExport.writtenChatState.size });
 
     // The file is now structurally clean. Decide how to proceed based on
     // whether we have a turn watermark.
@@ -1125,31 +1214,49 @@
       }
       if (fileWatermark != null) {
         liveExport.lastWrittenTick = fileWatermark;
+        dbg(trace, 'using file watermark', { fileWatermark });
         setStatus('Live export resumed. Catching up…');
+        syncPhase = 'Fetching history…';
         await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
+        syncPhase = 'Backfilling characters…';
         await backfillCharactersInFile();
+        syncPhase = 'Writing missing turns…';
         await appendNewTurns();
-        // appendNewTurns persists only when it actually writes; force a save
-        // so the watermark lands in IDB even if there were no new turns.
         await persistLiveExport();
+        syncPhase = null;
+        const finalSnap = await callMain('getSnapshot');
+        const count = finalSnap?.turns?.length || 0;
+        setStatus(`Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`);
+        dbg(trace, 'done', { mode: 'watermark-from-file', count });
       } else if (cleaned.trim().length > 0) {
         // File has content but no parseable turn structure. Refusing
         // initialWrite here is the last line of defense against the
         // destructive overwrite path — we'd rather force the user to
         // pick a different file than silently shred their content.
+        syncPhase = null;
         setStatus("Stored file has unrecognizable content. Stop live export and pick a different file, or clear this one.");
         liveExport = null;
         notifyBadge(false);
         return { ok: false, message: 'unrecognizable existing content — refusing to overwrite' };
       } else {
         setStatus('Live export resumed. Rebuilding file…');
+        // syncPhase lifecycle is managed inside initialWrite
         await initialWrite();
       }
     } else {
+      dbg(trace, 'using IDB watermark', { recordLastWrittenTick: liveExport.lastWrittenTick });
       setStatus('Live export resumed. Catching up…');
+      syncPhase = 'Fetching history…';
       await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
+      syncPhase = 'Backfilling characters…';
       await backfillCharactersInFile();
+      syncPhase = 'Writing missing turns…';
       await appendNewTurns();
+      syncPhase = null;
+      const finalSnap = await callMain('getSnapshot');
+      const count = finalSnap?.turns?.length || 0;
+      setStatus(`Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`);
+      dbg(trace, 'done', { mode: 'watermark-from-IDB', count });
     }
     return { ok: true };
   }
@@ -1160,13 +1267,15 @@
   async function initialWrite() {
     if (!liveExport) return;
     try {
+      syncPhase = 'Fetching history…';
       await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
       const snap = await callMain('getSnapshot');
+      syncPhase = 'Building file…';
       // Don't include the live in-progress turn in the persistent file —
       // we only commit completed turns. The live turn is for one-off Current
       // turn downloads.
       const md = buildMarkdown(snap, { ...currentConfig, storyIncludeMarkers: true }, { includeLive: false });
-      await writeToHandle(liveExport.handle, md);
+      await writeToHandle(liveExport.handle, md, 'initialWrite');
       const lastTick = snap.turns.length ? snap.turns[snap.turns.length - 1].tick : null;
       liveExport.lastWrittenTick = lastTick;
       // buildMarkdown just rendered every chat in cache as a full block, so
@@ -1174,8 +1283,10 @@
       // the delta past this point.
       seedWrittenChatStateFromCache(snap, liveExport.writtenChatState);
       await persistLiveExport();
-      setStatus(`Live export: ${snap.turns.length} turn${snap.turns.length === 1 ? '' : 's'} written.`, 0);
+      syncPhase = null;
+      setStatus(`Sync complete — ${snap.turns.length} turn${snap.turns.length === 1 ? '' : 's'} up to date`);
     } catch (e) {
+      syncPhase = null;
       console.error('[voyage-story] initialWrite:', e);
       // The first write failed — "live export active" would be a lie. Clear
       // state so the popup falls back to "Start live export" instead of
@@ -1217,9 +1328,18 @@
           && (cutoff == null || t.tick > cutoff)
           && isTurnComplete(t)
       );
-      if (newTurns.length === 0) return;
+      if (newTurns.length === 0) {
+        dbg('appendNewTurns:noop', { cutoff, totalTurns: (snap.turns || []).length });
+        return;
+      }
       const md = buildTurnRangeMarkdown(newTurns, snap, { ...currentConfig, storyIncludeMarkers: true }, liveExport.writtenChatState);
-      await appendToHandle(liveExport.handle, md);
+      dbg('appendNewTurns:writing', {
+        cutoff,
+        newTickRange: [newTurns[0].tick, newTurns[newTurns.length - 1].tick],
+        newTurnCount: newTurns.length,
+        bytes: md.length,
+      });
+      await appendToHandle(liveExport.handle, md, 'appendNewTurns');
       const newLast = newTurns.reduce((m, t) => Math.max(m, t.tick), cutoff ?? -Infinity);
       liveExport.lastWrittenTick = newLast;
       await persistLiveExport();
@@ -1242,28 +1362,41 @@
   async function backfillCharactersInFile() {
     if (!liveExport) return;
     if (!currentConfig.storyIncludeCharacters) return;
+    const trace = newTraceId('backfill');
     try {
       const file = await liveExport.handle.getFile();
       const content = await file.text();
-      if (!content) return;
+      dbg(trace, 'start', { fileBytes: file.size, summary: summarizeContent(content) });
+      if (!content) {
+        dbg(trace, 'skip', { reason: 'empty file' });
+        return;
+      }
 
       const snap = await callMain('getSnapshot');
       const turnsByTick = new Map();
       for (const t of (snap.turns || [])) {
         if (typeof t?.tick === 'number') turnsByTick.set(t.tick, t);
       }
-      if (turnsByTick.size === 0) return;
+      if (turnsByTick.size === 0) {
+        dbg(trace, 'skip', { reason: 'no turns in cache' });
+        return;
+      }
+      dbg(trace, 'cache loaded', { cacheTurns: turnsByTick.size });
 
       const pieces = [];
       let lastIdx = 0;
       let backfilled = 0;
+      const decisions = [];
       const markerRe = /<!--\s*voyage-turn:tick=(\d+)\s*-->/g;
       for (const m of content.matchAll(markerRe)) {
         const tick = parseInt(m[1], 10);
         const markerEnd = m.index + m[0].length;
         // Only operate on the canonical "marker\n\n" shape our writer emits;
         // refuse to splice into anything else.
-        if (content[markerEnd] !== '\n' || content[markerEnd + 1] !== '\n') continue;
+        if (content[markerEnd] !== '\n' || content[markerEnd + 1] !== '\n') {
+          decisions.push({ tick, skip: 'non-canonical marker tail' });
+          continue;
+        }
         const insertAt = markerEnd + 2;
 
         // Scope idempotency check to this turn's block. \n##\s matches only the
@@ -1276,25 +1409,62 @@
         const block = content.slice(insertAt, blockEnd);
         // The Characters line is distinctive enough (emoji + italic + literal
         // "Characters:") that a substring check has no realistic false-positive risk.
-        if (block.includes('*🎭 Characters: ')) continue;
+        if (block.includes('*🎭 Characters: ')) {
+          decisions.push({ tick, skip: 'already has characters line' });
+          continue;
+        }
 
         const turn = turnsByTick.get(tick);
-        if (!turn) continue;
+        if (!turn) {
+          decisions.push({ tick, skip: 'tick not in cache' });
+          continue;
+        }
         const chars = extractTurnCharacters(turn);
-        if (chars.length === 0) continue;
+        if (chars.length === 0) {
+          decisions.push({ tick, skip: 'no characters extracted' });
+          continue;
+        }
 
+        decisions.push({ tick, insert: chars, insertAt, blockEnd });
         pieces.push(content.slice(lastIdx, insertAt));
         pieces.push(`*🎭 Characters: ${chars.join(', ')}*\n\n`);
         lastIdx = insertAt;
         backfilled++;
       }
 
-      if (backfilled === 0) return;
+      dbg(trace, 'decisions', { backfilled, total: decisions.length, decisions });
+
+      if (backfilled === 0) {
+        dbg(trace, 'done:noop');
+        return;
+      }
       pieces.push(content.slice(lastIdx));
-      await writeToHandle(liveExport.handle, pieces.join(''));
+      const out = pieces.join('');
+      const outSummary = summarizeContent(out);
+      const inSummary = summarizeContent(content);
+      // Defense check: if the rebuild dropped any turn marker or chat marker
+      // that was in the input, refuse to write. We're supposed to be strictly
+      // additive — any marker delta means a slicing bug.
+      if (
+        outSummary.turns < inSummary.turns ||
+        outSummary.chatStarts < inSummary.chatStarts ||
+        outSummary.chatEnds < inSummary.chatEnds
+      ) {
+        console.error('[voyage-story] backfillCharactersInFile: refusing to write — would drop markers', {
+          inSummary, outSummary,
+        });
+        dbg(trace, 'abort:would-drop-markers', { inSummary, outSummary });
+        return;
+      }
+      dbg(trace, 'writing', {
+        preBytes: content.length, postBytes: out.length, delta: out.length - content.length,
+        inSummary, outSummary,
+      });
+      await writeToHandle(liveExport.handle, out, 'backfillCharactersInFile');
       setStatus(`Backfilled Characters into ${backfilled} existing turn${backfilled === 1 ? '' : 's'}.`);
     } catch (e) {
       console.error('[voyage-story] backfillCharactersInFile:', e);
+      dbg(trace, 'error', { message: e?.message, stack: e?.stack });
     }
   }
 
@@ -1321,6 +1491,7 @@
 
   async function liveAppendChats() {
     if (!liveExport) return;
+    const trace = newTraceId('liveAppendChats');
     try {
       const snap = await callMain('getSnapshot');
       const playerName = snap.character?.characterChoices?.name || 'Player';
@@ -1328,22 +1499,33 @@
 
       const out = [];
       const toCommit = [];
-      // Force storyIncludeMarkers on for the live-export path so the start/end
-      // chat markers actually land in the file. Without them, a future resume
-      // can't seed writtenChatState from the file and we're back to the
-      // permanent-suppression bug.
       const writeConfig = { ...currentConfig, storyIncludeMarkers: true };
+      const perChat = [];
       for (const chat of (snap.npcChats || [])) {
         const key = chatKey(chat);
         const prev = writtenState.get(key);
+        const before = out.length;
         const wrote = pushChat(out, chat, playerName, writeConfig, prev);
-        if (wrote) toCommit.push({ key, state: snapshotChatState(chat) });
+        if (wrote) {
+          toCommit.push({ key, state: snapshotChatState(chat) });
+          perChat.push({
+            key, turnTick: chat.turnTick, closed: !!chat.closed,
+            prevClosed: !!prev?.closed, prevMessageCount: prev?.messageCount ?? null,
+            cacheMessageCount: chat.messages?.length || 0,
+            linesEmitted: out.length - before,
+          });
+        }
       }
-      if (out.length === 0) return;
-      await appendToHandle(liveExport.handle, out.join('\n'));
+      if (out.length === 0) {
+        dbg(trace, 'noop', { snapChats: (snap.npcChats || []).length });
+        return;
+      }
+      dbg(trace, 'writing', { perChat, bytes: out.join('\n').length });
+      await appendToHandle(liveExport.handle, out.join('\n'), 'liveAppendChats');
       for (const { key, state } of toCommit) writtenState.set(key, state);
     } catch (e) {
       console.error('[voyage-story] liveAppendChats:', e);
+      dbg(trace, 'error', { message: e?.message });
       setStatus(`Live export error: ${e.message}`, 5000);
     }
   }
@@ -1422,7 +1604,25 @@
       // newBlock ends with '\n' (trailing '' element from pushTurn joined with '\n').
       // The extra '\n' produces '\n\n' before the next heading — matching normal spacing.
       const newContent = content.slice(0, startIdx) + newBlock + '\n' + content.slice(endIdx);
-      await writeToHandle(liveExport.handle, newContent);
+      // Defense check: marker counts must be conserved across rewrites.
+      const inSummary = summarizeContent(content);
+      const outSummary = summarizeContent(newContent);
+      if (
+        outSummary.turns < inSummary.turns ||
+        outSummary.chatStarts < inSummary.chatStarts ||
+        outSummary.chatEnds < inSummary.chatEnds
+      ) {
+        console.error('[voyage-story] rewriteTurnInFile: refusing to write — would drop markers', {
+          tick, inSummary, outSummary, startIdx, endIdx,
+        });
+        return;
+      }
+      dbg('rewriteTurnInFile', {
+        tick, startIdx, endIdx,
+        replacedBytes: endIdx - startIdx, newBlockBytes: newBlock.length + 1,
+        inSummary, outSummary,
+      });
+      await writeToHandle(liveExport.handle, newContent, `rewriteTurnInFile(${tick})`);
       setStatus(`Turn ${tick} rewritten in live export.`, 3000);
     } catch (e) {
       console.error('[voyage-story] rewriteTurnInFile:', e);
@@ -1501,16 +1701,31 @@
   // callers to seed writtenChatState from. Cleans up in-place in the file
   // via a single writeToHandle call when anything changed.
   async function preSyncCleanupChatBlocks(content, snap) {
-    if (!content) return { content, dirty: false };
+    const trace = newTraceId('preSyncCleanup');
+    if (!content) {
+      dbg(trace, 'skip', { reason: 'empty content' });
+      return { content, dirty: false };
+    }
     const blocks = parseNpcChatBlocksInFile(content);
     const orphans = blocks.filter((b) => !b.closed);
-    if (orphans.length === 0) return { content, dirty: false };
+    dbg(trace, 'parsed', {
+      totalBlocks: blocks.length,
+      closed: blocks.length - orphans.length,
+      orphans: orphans.length,
+      sources: Array.from(new Set(blocks.map((b) => b.source))),
+      blockKeys: blocks.map((b) => ({ key: b.key, closed: b.closed, source: b.source })),
+    });
+    if (orphans.length === 0) {
+      dbg(trace, 'done:noop', { reason: 'no orphans' });
+      return { content, dirty: false };
+    }
 
     // Iterate from end → start so splicing one orphan doesn't shift the
     // indices of earlier orphans.
     const sortedOrphans = orphans.slice().sort((a, b) => b.startIdx - a.startIdx);
     let newContent = content;
     let changed = false;
+    const orphanDecisions = [];
 
     for (const block of sortedOrphans) {
       const cacheChat = (snap?.npcChats || []).find(
@@ -1518,31 +1733,50 @@
       );
       // Chat still open in the current page session — let the live writer
       // handle the eventual close. Leave content untouched.
-      if (cacheChat && !cacheChat.closed) continue;
+      if (cacheChat && !cacheChat.closed) {
+        orphanDecisions.push({ key: block.key, action: 'leave-open' });
+        continue;
+      }
 
       const orphanEnd = findOrphanContentEnd(newContent, block.startIdx);
       const tailHasBlankLine = newContent.slice(0, orphanEnd).endsWith('\n\n');
       const tailHasNewline   = newContent.slice(0, orphanEnd).endsWith('\n');
-      // Make sure the synthetic content lands on its own paragraph break, no
-      // matter how the orphan's last line was terminated.
       const leader = tailHasBlankLine ? '' : (tailHasNewline ? '\n' : '\n\n');
 
       let body;
+      let action;
       if (cacheChat && cacheChat.closed && cacheChat.summary) {
         body = `*Summary: ${cacheChat.summary}*\n\n<!-- voyage-npc-chat:end:tick=${block.tick}:npc=${block.slug} -->\n\n`;
+        action = 'close-with-summary';
       } else if (cacheChat && cacheChat.closed) {
-        // Closed in cache but no summary captured (closeNpcChat fired without
-        // the server-side summary field — uncommon but possible). Seal the
-        // block without a summary line.
         body = `<!-- voyage-npc-chat:end:tick=${block.tick}:npc=${block.slug} -->\n\n`;
+        action = 'close-no-summary';
       } else {
         body = `*Conversation interrupted — live export was disconnected before it closed.*\n\n<!-- voyage-npc-chat:end:tick=${block.tick}:npc=${block.slug} -->\n\n`;
+        action = 'close-interrupted';
       }
 
       newContent = newContent.slice(0, orphanEnd) + leader + body + newContent.slice(orphanEnd);
       changed = true;
+      orphanDecisions.push({ key: block.key, action, orphanEnd, insertedBytes: leader.length + body.length });
     }
 
+    // Defense check: marker counts must be ≥ input. Cleanup is supposed to
+    // only add end markers and optional notes — never remove anything.
+    const inSummary = summarizeContent(content);
+    const outSummary = summarizeContent(newContent);
+    if (
+      outSummary.turns < inSummary.turns ||
+      outSummary.chatStarts < inSummary.chatStarts ||
+      outSummary.chatEnds < inSummary.chatEnds
+    ) {
+      console.error('[voyage-story] preSyncCleanupChatBlocks: refusing to commit — would drop markers', {
+        inSummary, outSummary,
+      });
+      dbg(trace, 'abort:would-drop-markers', { inSummary, outSummary, orphanDecisions });
+      return { content, dirty: false };
+    }
+    dbg(trace, 'done', { changed, inSummary, outSummary, orphanDecisions });
     return { content: newContent, dirty: changed };
   }
 
@@ -1691,6 +1925,7 @@
         : { active: false },
       hasStoredHandle,
       suggestedFilename,
+      syncPhase,
       lastStatus: lastStatusMessage,
       lastStatusAt,
       filePickerSupported: typeof window.showSaveFilePicker === 'function',
@@ -1736,7 +1971,59 @@
   // The popup calls into the picker from inside this isolated world via
   // chrome.scripting.executeScript so the handle is created and used in
   // the same context — never crossing a structured-clone boundary.
-  window.__voyageStoryHelper = { startLiveExport };
+  // Debug surface for live-console diagnostics. Call from the Voyage tab's
+  // DevTools console — e.g. `__voyageStoryHelper.setDebug(true)` to enable
+  // verbose logs, or `await __voyageStoryHelper.dumpState()` to inspect the
+  // current liveExport / file / cache snapshot.
+  async function dumpState() {
+    let fileInfo = null;
+    if (liveExport?.handle) {
+      try {
+        const f = await liveExport.handle.getFile();
+        const text = await f.text();
+        fileInfo = {
+          filename: f.name,
+          bytes: f.size,
+          summary: summarizeContent(text),
+          chatBlocks: parseNpcChatBlocksInFile(text).map((b) => ({
+            key: b.key, closed: b.closed, source: b.source,
+            startIdx: b.startIdx, endIdx: b.endIdx,
+          })),
+        };
+      } catch (e) {
+        fileInfo = { error: e?.message };
+      }
+    }
+    let snap = null;
+    try { snap = await callMain('getSnapshot'); } catch {}
+    return {
+      DEBUG_LOG,
+      liveExport: liveExport ? {
+        roomId: liveExport.roomId,
+        lastWrittenTick: liveExport.lastWrittenTick,
+        writtenChatStateSize: liveExport.writtenChatState.size,
+        writtenChatStateKeys: Array.from(liveExport.writtenChatState.keys()),
+      } : null,
+      file: fileInfo,
+      cache: snap ? {
+        roomId: snap.roomId,
+        turnCount: (snap.turns || []).length,
+        latestTick: (snap.turns || []).reduce((m, t) => Math.max(m, t.tick ?? -1), -1),
+        npcChats: (snap.npcChats || []).map((c) => ({
+          npcName: c.npcName, turnTick: c.turnTick,
+          messageCount: c.messages?.length || 0,
+          closed: !!c.closed, hasSummary: !!c.summary,
+        })),
+      } : null,
+    };
+  }
+  function setDebug(on) {
+    DEBUG_LOG = !!on;
+    try { chrome.storage.local.set({ voyageStoryDebug: DEBUG_LOG }); } catch {}
+    try { console.log('[voyage-story] verbose debug logging', DEBUG_LOG ? 'enabled' : 'disabled'); } catch {}
+    return DEBUG_LOG;
+  }
+  window.__voyageStoryHelper = { startLiveExport, dumpState, setDebug };
 
   // ---------- Lifecycle ----------
   // No page UI to manage — just load config and let messages drive everything.
