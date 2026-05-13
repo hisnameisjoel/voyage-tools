@@ -53,6 +53,7 @@ The popup (`popup.js`) talks to `voyage-story-exporter.js` exclusively via `chro
 | `storyIncludeStatus` | `true` | Status updates in export |
 | `storyIncludeNpcChats` | `false` | NPC chat summaries in export |
 | `storyIncludeNpcConversations` | `true` | Full NPC dialog blocks in export |
+| `storyIncludeCharacters` | `true` | Per-turn "Characters: X, Y, Z" cast line in export |
 | `storyIncludeMusic` | `false` | Music context in export |
 | `storyIncludeMarkers` | `true` | HTML comment resume markers in export |
 | `voyage-last-filename:{roomId}` | — | Last picked filename per campaign (harmless to retain after Stop) |

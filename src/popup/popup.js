@@ -24,6 +24,7 @@ const STORY_CONFIG = [
   'storyIncludeStatus',
   'storyIncludeNpcChats',
   'storyIncludeNpcConversations',
+  'storyIncludeCharacters',
   'storyIncludeMusic',
   'storyIncludeMarkers',
 ];

@@ -5,6 +5,23 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.4] - 2026-05-13
+
+### Added
+- NPC chat blocks now carry `<!-- voyage-npc-chat:start:tick=N:npc=Slug -->` and matching end markers in the live-export file, so a resume can reliably tell which conversations are already on disk
+- Pre-sync cleanup phase on resume: orphan chat blocks (start marker but no end marker) get closed in place — with the cache's summary if available, or an "interrupted" note if not — before any catch-up writes run
+- AI summary line (`*Summary: …*`) now renders inside every full NPC conversation block when the chat closes; previously it required the separate "summaries" toggle
+- New "Characters in scene" export toggle (default on) — renders a per-turn `*🎭 Characters: …*` cast line derived from `playerInputs` keys and story-paragraph speaker prefixes (narrator excluded)
+- Retroactive backfill on live-export start/resume: existing turns that lack a Characters line get one spliced in non-destructively, anchored on each turn's resume marker. Idempotent and conservative — files with non-canonical formatting are left untouched
+
+### Fixed
+- NPC conversations no longer get permanently suppressed on resume when the cache happens to have them but the file does not — `writtenChatState` is now seeded from file markers (the only reliable source of truth) instead of from the transient cache
+- Resume with an unrecognizable-but-non-empty file now refuses to proceed instead of falling through to a full overwrite, eliminating the last `initialWrite()` path that could shred prior content
+- `rewriteTurnInFile` now treats `<!-- voyage-npc-chat:start: -->` markers as a forward boundary, so editing a turn whose next-turn chat block is already present no longer strips the chat's start marker
+
+### Changed
+- The "NPC conversation summaries" toggle has been clarified: full conversations now always include the AI summary, and the separate summary toggle only controls the compact one-liner mode used when full conversations are off
+
 ## [1.0.3] - 2026-05-12
 
 ### Fixed

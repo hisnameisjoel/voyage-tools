@@ -64,6 +64,10 @@
     // servers when the next turn commits, so we can only capture them if
     // we're actively listening during the conversation.
     storyIncludeNpcConversations: true,
+    // Renders a one-line "Characters: X, Y, Z" header per turn, derived
+    // from playerInputs keys and the speaker prefixes of each story
+    // paragraph (Narrator excluded).
+    storyIncludeCharacters: true,
   };
   const CONFIG_KEYS = Object.keys(DEFAULT_CONFIG);
   let currentConfig = { ...DEFAULT_CONFIG };
@@ -368,14 +372,30 @@
     return out.join('\n');
   }
 
+  // NPC names are rendered into HTML-comment markers. Slug to alphanumeric
+  // + underscore so (a) the marker can't accidentally close itself with `--`
+  // and (b) the slug is a stable round-trip key — file-side parsing recovers
+  // the same slug we computed at write time. The slug is what chatKey uses,
+  // so writtenChatState entries match cleanly against file markers.
+  function slugifyNpcName(name) {
+    const s = String(name || '').replace(/[^a-zA-Z0-9]+/g, '_').replace(/^_+|_+$/g, '');
+    return s || 'unknown';
+  }
   function chatKey(chat) {
-    return `${chat.npcName}::${chat.turnTick}`;
+    return `${slugifyNpcName(chat.npcName)}::${chat.turnTick}`;
   }
   function snapshotChatState(chat) {
     return {
       messageCount: chat.messages?.length || 0,
       summary: chat.summary || null,
+      closed: !!chat.closed,
     };
+  }
+  // Sentinel for chats whose body is already in the file but whose exact
+  // message count is unknown (seeded from file markers). Infinity guarantees
+  // any pushChat slice against this prev produces zero new messages.
+  function sealedChatState(summary) {
+    return { messageCount: Infinity, summary: summary || '__sealed__', closed: true };
   }
 
   // NPC chats are keyed by the tick of the turn they precede (the turn the
@@ -394,32 +414,56 @@
   // Renders a single NPC chat — either as a full block on first write, or
   // as a delta append on subsequent writes for the same chat.
   //
-  // prev: { messageCount, summary } from writtenChatState, or null/undefined
-  //       on the first write. When provided, only messages past prev.messageCount
+  // prev: { messageCount, summary, closed } from writtenChatState, or null on
+  //       the first write. When provided, only messages past prev.messageCount
   //       and a summary that differs from prev.summary are emitted (no header).
+  //       When prev.closed is already true, the chat is fully written — nothing
+  //       further is emitted, even if the cache picks up additional state.
   //
-  // Layout depends on the toggle pair:
-  //   storyIncludeNpcConversations ON  → full dialog block; summary line at
-  //                                       the end if storyIncludeNpcChats is
-  //                                       also on
-  //   storyIncludeNpcConversations OFF → if storyIncludeNpcChats is on,
-  //                                       render a compact single-line summary
-  //                                       in the same style as statusUpdate
-  //                                       summaries (the historical fallback)
-  //   both OFF                         → nothing
+  // Layout (when storyIncludeMarkers is on, which is forced during live export):
+  //   <!-- voyage-npc-chat:start:tick=N:npc=Slug -->
+  //   ### 💬 Conversation with NpcName
+  //
+  //   **NpcName**: dialogue…
+  //   **Player**: dialogue…
+  //
+  //   *Summary: …*                                    ← when closeNpcChat fires
+  //   <!-- voyage-npc-chat:end:tick=N:npc=Slug -->    ← when closeNpcChat fires
+  //
+  // Toggle pair behavior:
+  //   storyIncludeNpcConversations ON  → full dialog block; summary always at
+  //                                       the end of the block when the chat
+  //                                       closes (no longer gated on the
+  //                                       NpcChats toggle).
+  //   storyIncludeNpcConversations OFF → if storyIncludeNpcChats is on, render
+  //                                       a compact single-line summary in the
+  //                                       same style as statusUpdate summaries.
+  //   both OFF                         → nothing.
   //
   // Returns true if anything was emitted, so callers can update
   // writtenChatState only when an actual write happened.
   function pushChat(out, chat, playerName, config, prev) {
+    // Once a chat has been sealed (end-marker written), any cache state past
+    // that point is moot — the conversation is closed on disk. Skip entirely
+    // so we don't emit a duplicate summary line or trailing end-marker.
+    if (prev?.closed) return false;
+
     const startIdx = prev?.messageCount || 0;
     const prevSummary = prev?.summary || null;
     const curSummary  = chat.summary    || null;
     const summaryChanged = curSummary !== prevSummary;
     const newMessages = (chat.messages || []).slice(startIdx);
-    if (newMessages.length === 0 && !summaryChanged) return false;
+    const closingNow = !!chat.closed && !prev?.closed;
+    if (newMessages.length === 0 && !summaryChanged && !closingNow) return false;
+
+    const slug = slugifyNpcName(chat.npcName);
+    const useMarkers = !!config.storyIncludeMarkers && typeof chat.turnTick === 'number';
 
     if (config.storyIncludeNpcConversations) {
       if (!prev) {
+        if (useMarkers) {
+          out.push(`<!-- voyage-npc-chat:start:tick=${chat.turnTick}:npc=${slug} -->`);
+        }
         out.push(`### 💬 Conversation with ${chat.npcName}`);
         out.push('');
       }
@@ -439,8 +483,14 @@
         }
         out.push('');
       }
-      if (config.storyIncludeNpcChats && summaryChanged && curSummary) {
+      // Summary always rides with the conversation now — the NpcChats toggle
+      // is reserved for the compact one-liner mode below.
+      if (summaryChanged && curSummary) {
         out.push(`*Summary: ${curSummary}*`);
+        out.push('');
+      }
+      if (closingNow && useMarkers) {
+        out.push(`<!-- voyage-npc-chat:end:tick=${chat.turnTick}:npc=${slug} -->`);
         out.push('');
       }
       return true;
@@ -450,6 +500,39 @@
       return true;
     }
     return false;
+  }
+
+  // Pull a unique list of scene participants for a turn. Names come from two
+  // sources: playerInputs keys (the acting player character) and the speaker
+  // prefix of each story paragraph ("Speaker: …" — the Voyage server uses the
+  // same shape for both narration and dialogue). Narrator lines are dropped.
+  // Insertion order is preserved so the result reads in roughly the order
+  // characters appear in the scene.
+  function extractTurnCharacters(turn) {
+    const names = new Set();
+    for (const name of Object.keys(turn.playerInputs || {})) {
+      const trimmed = String(name || '').trim();
+      if (trimmed) names.add(trimmed);
+    }
+    const paragraphs =
+      Array.isArray(turn.storyParagraphs) && turn.storyParagraphs.length
+        ? turn.storyParagraphs
+        : (typeof turn.storyMessage === 'string'
+            ? turn.storyMessage.split(/\n{2,}/)
+            : []);
+    for (const p of paragraphs) {
+      if (typeof p !== 'string') continue;
+      const trimmed = p.trim();
+      // ': ' (with trailing space) matches Voyage's "Speaker: …" pattern and
+      // mirrors formatStoryParagraph's own delimiter — avoids false positives
+      // on stray colons inside narrator prose.
+      const idx = trimmed.indexOf(': ');
+      if (idx <= 0) continue;
+      const speaker = trimmed.slice(0, idx).trim();
+      if (!speaker || /^narrator$/i.test(speaker)) continue;
+      names.add(speaker);
+    }
+    return [...names];
   }
 
   function pushTurn(out, turn, config) {
@@ -463,6 +546,14 @@
       out.push(`<!-- voyage-turn:tick=${turn.tick} -->`);
     }
     out.push('');
+
+    if (config.storyIncludeCharacters) {
+      const chars = extractTurnCharacters(turn);
+      if (chars.length) {
+        out.push(`*🎭 Characters: ${chars.join(', ')}*`);
+        out.push('');
+      }
+    }
 
     if (config.storyIncludeMusic && turn.musicContext) {
       const mc = turn.musicContext;
@@ -738,6 +829,115 @@
     return m ? m[1] : null;
   }
 
+  // NPC chat block markers — emitted by pushChat when live export is active.
+  // Slug captures alphanumeric+underscore (the output of slugifyNpcName), so
+  // the regex is strict enough that random `<!-- something -->` comments in
+  // user-edited text don't get confused for chat boundaries.
+  const NPC_CHAT_START_RE = /<!--\s*voyage-npc-chat:start:tick=(\d+):npc=([A-Za-z0-9_]+)\s*-->/g;
+  const NPC_CHAT_END_RE   = /<!--\s*voyage-npc-chat:end:tick=(\d+):npc=([A-Za-z0-9_]+)\s*-->/g;
+  // Legacy detection — files written before v1.0.4 didn't have NPC chat
+  // markers. The `### 💬 Conversation with NAME` heading is the only signal
+  // their boundary exists. Anchored to the start of a line.
+  const LEGACY_CHAT_HEADING_RE = /^### 💬 Conversation with (.+?)\s*$/gm;
+
+  // Returns chat blocks discovered in the file as an array of:
+  //   { key, slug, tick, startIdx, endIdx, closed, source }
+  // where `source` is 'marker' or 'legacy'. `endIdx` is the index AFTER the
+  // end marker (or null for orphans). `closed` is true only when a paired
+  // end marker was found at a position after the start marker.
+  function parseNpcChatBlocksInFile(text) {
+    const blocks = [];
+    const starts = [];
+    for (const m of text.matchAll(NPC_CHAT_START_RE)) {
+      starts.push({
+        tick: parseInt(m[1], 10),
+        slug: m[2],
+        startIdx: m.index,
+        markerLen: m[0].length,
+      });
+    }
+    const ends = [];
+    for (const m of text.matchAll(NPC_CHAT_END_RE)) {
+      ends.push({
+        tick: parseInt(m[1], 10),
+        slug: m[2],
+        idx: m.index,
+        markerLen: m[0].length,
+      });
+    }
+    // Pair each start with the nearest later end that shares (tick, slug) and
+    // hasn't already been consumed. Greedy left-to-right matching is safe
+    // because chats can't be nested (a turn commit closes any open chat).
+    const consumed = new Set();
+    for (const s of starts) {
+      const matchIdx = ends.findIndex(
+        (e, i) => !consumed.has(i) && e.tick === s.tick && e.slug === s.slug && e.idx > s.startIdx
+      );
+      if (matchIdx >= 0) {
+        consumed.add(matchIdx);
+        const e = ends[matchIdx];
+        blocks.push({
+          key: `${s.slug}::${s.tick}`,
+          slug: s.slug, tick: s.tick,
+          startIdx: s.startIdx,
+          endIdx: e.idx + e.markerLen,
+          closed: true,
+          source: 'marker',
+        });
+      } else {
+        blocks.push({
+          key: `${s.slug}::${s.tick}`,
+          slug: s.slug, tick: s.tick,
+          startIdx: s.startIdx,
+          endIdx: null,
+          closed: false,
+          source: 'marker',
+        });
+      }
+    }
+    if (blocks.length > 0) return blocks;
+
+    // Legacy fallback: scrape `### 💬 Conversation with NAME` headings and
+    // infer turnTick from the next `## Turn N` heading (chats precede their
+    // associated turn). Legacy blocks are assumed closed — we have no signal
+    // suggesting otherwise, and treating them as orphans would mass-trigger
+    // synthetic interruption markers in every pre-v1.0.4 file.
+    for (const m of text.matchAll(LEGACY_CHAT_HEADING_RE)) {
+      const name = m[1].trim();
+      const slug = slugifyNpcName(name);
+      const startIdx = m.index;
+      const after = text.slice(startIdx + m[0].length);
+      const nextTurnMatch = after.match(/\n##\s+Turn\s+(\d+)/);
+      if (!nextTurnMatch) continue;
+      const tick = parseInt(nextTurnMatch[1], 10);
+      blocks.push({
+        key: `${slug}::${tick}`,
+        slug, tick,
+        startIdx,
+        endIdx: startIdx + m[0].length + nextTurnMatch.index, // before next `\n## Turn`
+        closed: true,
+        source: 'legacy',
+      });
+    }
+    return blocks;
+  }
+
+  // Where an orphan chat block's content ends in the file — the next `## Turn`
+  // heading, the next chat start marker, or EOF. Used by the cleanup pass to
+  // know where to splice in a synthetic end marker.
+  function findOrphanContentEnd(content, startMarkerIdx) {
+    const after = content.slice(startMarkerIdx);
+    const markerEndRel = after.indexOf('-->');
+    const searchStart = markerEndRel >= 0 ? markerEndRel + 3 : 0;
+    const searchSlice = after.slice(searchStart);
+    let endRel = searchSlice.length;
+    const turnMatch = searchSlice.match(/\n##\s+Turn\s+\d+/);
+    if (turnMatch) endRel = Math.min(endRel, turnMatch.index + 1);
+    const nextStartMatch = searchSlice.match(/<!--\s*voyage-npc-chat:start:/);
+    if (nextStartMatch) endRel = Math.min(endRel, nextStartMatch.index);
+    return startMarkerIdx + searchStart + endRel;
+  }
+
   // Receives a FileSystemFileHandle (and roomId) from the popup, which has
   // already invoked showSaveFilePicker under its own user gesture.
   //
@@ -826,14 +1026,19 @@
     storedHandleRoomId = snap.roomId;
     rememberFilename(snap.roomId, handle.name);
     notifyBadge(true);
-    // Seed the chat-write state from whatever's currently in the cache: any
-    // chats we already know about were presumably written in the previous
-    // session (or arrived after the file was last saved). Treating them as
-    // "already written" prevents duplicate rendering when liveAppendChats
-    // fires for chat events that come in after resume.
-    seedWrittenChatState(snap, liveExport.writtenChatState);
     setStatus(`Resuming from turn ${parsed.tick}. Catching up…`);
+    // Pre-sync cleanup: close any orphan chat blocks in the file (e.g.
+    // chats left open by a crashed prior session) before we seed the
+    // writtenChatState. Without this, seedWrittenChatStateFromFile would
+    // see only the half-written orphan and the live writer could end up
+    // emitting duplicate content past it.
+    const { content: cleaned } = await preSyncCleanupChatBlocks(existing, snap);
+    if (cleaned !== existing) {
+      await writeToHandle(handle, cleaned);
+    }
+    seedWrittenChatStateFromFile(cleaned, snap, liveExport.writtenChatState);
     await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
+    await backfillCharactersInFile();
     await appendNewTurns();
     // appendNewTurns persists only when it actually wrote something; make
     // sure the handle + tick land in IDB even if there was nothing new.
@@ -887,33 +1092,55 @@
     storedHandleRoomId = snap.roomId;
     rememberFilename(snap.roomId, record.handle?.name);
     notifyBadge(true);
-    seedWrittenChatState(snap, liveExport.writtenChatState);
 
-    // If we have no record of having written before (e.g. a pre-1.5.2
-    // install), check the file itself before doing a destructive full
-    // overwrite. Live-captured NPC conversations are only in the file —
-    // Voyage wipes full chat text from the server when the next turn
-    // commits — so rebuilding from server state would silently erase them.
-    // If the file already has recognizable Voyage content, use its own
-    // watermark and append-only. Only do a full initialWrite on an empty
-    // or unrecognizable file.
+    // Read the file once up front. We use it for three things in order:
+    //   1. Pre-sync cleanup: close any orphan NPC chat blocks left open by a
+    //      crashed prior session, so the file is structurally complete before
+    //      any further writes.
+    //   2. Seed writtenChatState from file markers (the only reliable source
+    //      of truth for what's actually on disk — server-side chat history
+    //      gets wiped after each turn commit).
+    //   3. Fall back to file-derived watermark when IDB has none (pre-1.5.2
+    //      installs, or any future state-loss scenario).
+    let existing = '';
+    try {
+      const f = await liveExport.handle.getFile();
+      if (f.size > 0) existing = await f.text();
+    } catch {}
+
+    const { content: cleaned, dirty } = await preSyncCleanupChatBlocks(existing, snap);
+    if (dirty) {
+      try { await writeToHandle(liveExport.handle, cleaned); }
+      catch (e) { console.warn('[voyage-story] preSyncCleanup write failed:', e); }
+    }
+    seedWrittenChatStateFromFile(cleaned, snap, liveExport.writtenChatState);
+
+    // The file is now structurally clean. Decide how to proceed based on
+    // whether we have a turn watermark.
     if (liveExport.lastWrittenTick == null) {
       let fileWatermark = null;
-      try {
-        const f = await liveExport.handle.getFile();
-        if (f.size > 0) {
-          const parsed = parseLastTickInFile(await f.text());
-          if (parsed.tick != null) fileWatermark = parsed.tick;
-        }
-      } catch {}
+      if (cleaned) {
+        const parsed = parseLastTickInFile(cleaned);
+        if (parsed.tick != null) fileWatermark = parsed.tick;
+      }
       if (fileWatermark != null) {
         liveExport.lastWrittenTick = fileWatermark;
         setStatus('Live export resumed. Catching up…');
         await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
+        await backfillCharactersInFile();
         await appendNewTurns();
         // appendNewTurns persists only when it actually writes; force a save
         // so the watermark lands in IDB even if there were no new turns.
         await persistLiveExport();
+      } else if (cleaned.trim().length > 0) {
+        // File has content but no parseable turn structure. Refusing
+        // initialWrite here is the last line of defense against the
+        // destructive overwrite path — we'd rather force the user to
+        // pick a different file than silently shred their content.
+        setStatus("Stored file has unrecognizable content. Stop live export and pick a different file, or clear this one.");
+        liveExport = null;
+        notifyBadge(false);
+        return { ok: false, message: 'unrecognizable existing content — refusing to overwrite' };
       } else {
         setStatus('Live export resumed. Rebuilding file…');
         await initialWrite();
@@ -921,6 +1148,7 @@
     } else {
       setStatus('Live export resumed. Catching up…');
       await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
+      await backfillCharactersInFile();
       await appendNewTurns();
     }
     return { ok: true };
@@ -944,7 +1172,7 @@
       // buildMarkdown just rendered every chat in cache as a full block, so
       // mark them all as fully written. Subsequent chat events render only
       // the delta past this point.
-      seedWrittenChatState(snap, liveExport.writtenChatState);
+      seedWrittenChatStateFromCache(snap, liveExport.writtenChatState);
       await persistLiveExport();
       setStatus(`Live export: ${snap.turns.length} turn${snap.turns.length === 1 ? '' : 's'} written.`, 0);
     } catch (e) {
@@ -1004,6 +1232,72 @@
     }
   }
 
+  // Non-destructive retroactive insert. For each turn marker in the file that
+  // doesn't already have a Characters line, splice one in immediately after the
+  // marker's blank line — using the cache's view of that turn's storyParagraphs.
+  // Idempotent (skips turns that already have the line) and conservative
+  // (skips any marker not followed by the canonical "\n\n" we ourselves emit,
+  // so hand-mangled files are left untouched). Called once at start/resume
+  // after pullAllHistory so the cache has every historical turn loaded.
+  async function backfillCharactersInFile() {
+    if (!liveExport) return;
+    if (!currentConfig.storyIncludeCharacters) return;
+    try {
+      const file = await liveExport.handle.getFile();
+      const content = await file.text();
+      if (!content) return;
+
+      const snap = await callMain('getSnapshot');
+      const turnsByTick = new Map();
+      for (const t of (snap.turns || [])) {
+        if (typeof t?.tick === 'number') turnsByTick.set(t.tick, t);
+      }
+      if (turnsByTick.size === 0) return;
+
+      const pieces = [];
+      let lastIdx = 0;
+      let backfilled = 0;
+      const markerRe = /<!--\s*voyage-turn:tick=(\d+)\s*-->/g;
+      for (const m of content.matchAll(markerRe)) {
+        const tick = parseInt(m[1], 10);
+        const markerEnd = m.index + m[0].length;
+        // Only operate on the canonical "marker\n\n" shape our writer emits;
+        // refuse to splice into anything else.
+        if (content[markerEnd] !== '\n' || content[markerEnd + 1] !== '\n') continue;
+        const insertAt = markerEnd + 2;
+
+        // Scope idempotency check to this turn's block. \n##\s matches only the
+        // next ## Turn heading (the trailing \s rules out ### chat headings),
+        // so any NPC chat blocks sitting between this turn and the next are
+        // included in our scan — that's fine, they don't contain Characters lines.
+        const afterInsert = content.slice(insertAt);
+        const nextMatch = afterInsert.match(/\n##\s/);
+        const blockEnd = nextMatch ? insertAt + nextMatch.index : content.length;
+        const block = content.slice(insertAt, blockEnd);
+        // The Characters line is distinctive enough (emoji + italic + literal
+        // "Characters:") that a substring check has no realistic false-positive risk.
+        if (block.includes('*🎭 Characters: ')) continue;
+
+        const turn = turnsByTick.get(tick);
+        if (!turn) continue;
+        const chars = extractTurnCharacters(turn);
+        if (chars.length === 0) continue;
+
+        pieces.push(content.slice(lastIdx, insertAt));
+        pieces.push(`*🎭 Characters: ${chars.join(', ')}*\n\n`);
+        lastIdx = insertAt;
+        backfilled++;
+      }
+
+      if (backfilled === 0) return;
+      pieces.push(content.slice(lastIdx));
+      await writeToHandle(liveExport.handle, pieces.join(''));
+      setStatus(`Backfilled Characters into ${backfilled} existing turn${backfilled === 1 ? '' : 's'}.`);
+    } catch (e) {
+      console.error('[voyage-story] backfillCharactersInFile:', e);
+    }
+  }
+
   function scheduleAppend() {
     if (!liveExport) return;
     clearTimeout(liveExport.debounceTimer);
@@ -1034,10 +1328,15 @@
 
       const out = [];
       const toCommit = [];
+      // Force storyIncludeMarkers on for the live-export path so the start/end
+      // chat markers actually land in the file. Without them, a future resume
+      // can't seed writtenChatState from the file and we're back to the
+      // permanent-suppression bug.
+      const writeConfig = { ...currentConfig, storyIncludeMarkers: true };
       for (const chat of (snap.npcChats || [])) {
         const key = chatKey(chat);
         const prev = writtenState.get(key);
-        const wrote = pushChat(out, chat, playerName, currentConfig, prev);
+        const wrote = pushChat(out, chat, playerName, writeConfig, prev);
         if (wrote) toCommit.push({ key, state: snapshotChatState(chat) });
       }
       if (out.length === 0) return;
@@ -1099,12 +1398,18 @@
       // Keep the \n before the heading as the separator from the prior block.
       const startIdx = headingNewlineIdx === -1 ? 0 : headingNewlineIdx + 1;
 
-      // Scan forward from the marker end to find the next heading of any level.
-      // \n## matches both ## Turn (level-2) and ### 💬 NPC chat (level-3) headings,
-      // so any chat blocks belonging to the *next* turn are left untouched.
+      // Scan forward from the marker end to find the next block boundary.
+      // Three things count as a boundary, in priority of leftmost match:
+      //   • \n##                            — next ## Turn or ### 💬 heading
+      //   • \n<!-- voyage-npc-chat:start:   — chat for the next turn (placed
+      //                                        immediately before its ### 💬
+      //                                        heading; must be preserved)
+      // Anything that follows the turn's body content but precedes the next
+      // boundary belongs to a downstream block and must be left untouched.
       const afterMarker = content.slice(markerIdx + markerStr.length);
-      const nextHeadingMatch = afterMarker.match(/\n##/);
-      // +1 to skip the \n so content.slice(endIdx) starts at the '#' of the next heading.
+      const nextHeadingMatch = afterMarker.match(/\n##|\n<!--\s*voyage-npc-chat:start:/);
+      // +1 to skip the \n so content.slice(endIdx) starts at the '#' or '<'
+      // of the next boundary token.
       const endIdx = nextHeadingMatch
         ? markerIdx + markerStr.length + nextHeadingMatch.index + 1
         : content.length;
@@ -1126,13 +1431,119 @@
   }
 
   // Snapshot the current cache state of all chats into writtenChatState.
-  // Called when we've just done a full render (initialWrite) or when we
-  // resume into an existing file where chats from prior sessions should
-  // be treated as already-written.
-  function seedWrittenChatState(snap, writtenChatState) {
+  // Called after a full render (initialWrite) where buildMarkdown emitted
+  // every chat in cache as a complete block — those are now on disk, so we
+  // mark every cached chat as sealed.
+  //
+  // NOT called blindly on resume — see seedWrittenChatStateFromFile for that.
+  // Seeding from cache alone on resume is what produced the "permanently
+  // suppressed chat" bug: a chat that arrived in cache after the file was
+  // last written would be marked already-written and never emitted.
+  function seedWrittenChatStateFromCache(snap, writtenChatState) {
     for (const chat of (snap?.npcChats || [])) {
       writtenChatState.set(chatKey(chat), snapshotChatState(chat));
     }
+  }
+
+  // Seed writtenChatState by scanning the existing file. The file is the only
+  // reliable source of truth for what's *actually* been written — server-side
+  // chat history gets wiped after each turn commits.
+  //
+  // For each marker-paired chat block, the chat is sealed (no further writes
+  // for that chatKey will be emitted). For each orphan start marker (i.e. the
+  // chat was begun but never closed), seed using the cache state if available
+  // so liveAppendChats can continue the conversation cleanly. The pre-sync
+  // cleanup pass is responsible for actually closing orphans in the file
+  // BEFORE we get here — by the time we seed, every block that needs sealing
+  // already has its end marker, so we set `closed: true`.
+  function seedWrittenChatStateFromFile(content, snap, writtenChatState) {
+    const blocks = parseNpcChatBlocksInFile(content);
+    for (const block of blocks) {
+      if (block.closed) {
+        writtenChatState.set(block.key, sealedChatState());
+      } else {
+        // Orphan that survived cleanup — only happens for chats still open in
+        // the current session (cache has them with closed=false). Seed with
+        // current cache state so the incremental writer picks up cleanly.
+        const cacheChat = (snap?.npcChats || []).find(
+          (c) => slugifyNpcName(c.npcName) === block.slug && c.turnTick === block.tick
+        );
+        if (cacheChat) {
+          writtenChatState.set(block.key, snapshotChatState(cacheChat));
+        } else {
+          // Shouldn't happen post-cleanup, but be defensive: treat as sealed
+          // so we don't accidentally re-emit on a future flush.
+          writtenChatState.set(block.key, sealedChatState());
+        }
+      }
+    }
+  }
+
+  // Pre-sync cleanup phase. Runs once on resume / re-start into an existing
+  // file, BEFORE the turn-catchup append. Walks every NPC chat block in the
+  // file and:
+  //   • closed (paired markers, or legacy `### 💬` block followed by a turn):
+  //       no-op — block is already complete on disk.
+  //   • orphan, cache HAS the chat closed:
+  //       splice in a synthetic close — `*Summary: …*` (if cache has one) and
+  //       an end marker — at the orphan's content boundary. Recovers a chat
+  //       whose closeNpcChat fired after the page died but before the writer
+  //       flushed the end marker.
+  //   • orphan, cache HAS the chat still open:
+  //       leave the file as-is. The chat is live in this session; the
+  //       incremental writer will close it normally on closeNpcChat.
+  //   • orphan, cache does NOT have the chat:
+  //       splice in an "interrupted" note + end marker. The chat is sealed
+  //       on disk so future writes can't append stray content; the note
+  //       makes the gap visible to the reader.
+  //
+  // Returns the (possibly rewritten) content, and a list of effects for
+  // callers to seed writtenChatState from. Cleans up in-place in the file
+  // via a single writeToHandle call when anything changed.
+  async function preSyncCleanupChatBlocks(content, snap) {
+    if (!content) return { content, dirty: false };
+    const blocks = parseNpcChatBlocksInFile(content);
+    const orphans = blocks.filter((b) => !b.closed);
+    if (orphans.length === 0) return { content, dirty: false };
+
+    // Iterate from end → start so splicing one orphan doesn't shift the
+    // indices of earlier orphans.
+    const sortedOrphans = orphans.slice().sort((a, b) => b.startIdx - a.startIdx);
+    let newContent = content;
+    let changed = false;
+
+    for (const block of sortedOrphans) {
+      const cacheChat = (snap?.npcChats || []).find(
+        (c) => slugifyNpcName(c.npcName) === block.slug && c.turnTick === block.tick
+      );
+      // Chat still open in the current page session — let the live writer
+      // handle the eventual close. Leave content untouched.
+      if (cacheChat && !cacheChat.closed) continue;
+
+      const orphanEnd = findOrphanContentEnd(newContent, block.startIdx);
+      const tailHasBlankLine = newContent.slice(0, orphanEnd).endsWith('\n\n');
+      const tailHasNewline   = newContent.slice(0, orphanEnd).endsWith('\n');
+      // Make sure the synthetic content lands on its own paragraph break, no
+      // matter how the orphan's last line was terminated.
+      const leader = tailHasBlankLine ? '' : (tailHasNewline ? '\n' : '\n\n');
+
+      let body;
+      if (cacheChat && cacheChat.closed && cacheChat.summary) {
+        body = `*Summary: ${cacheChat.summary}*\n\n<!-- voyage-npc-chat:end:tick=${block.tick}:npc=${block.slug} -->\n\n`;
+      } else if (cacheChat && cacheChat.closed) {
+        // Closed in cache but no summary captured (closeNpcChat fired without
+        // the server-side summary field — uncommon but possible). Seal the
+        // block without a summary line.
+        body = `<!-- voyage-npc-chat:end:tick=${block.tick}:npc=${block.slug} -->\n\n`;
+      } else {
+        body = `*Conversation interrupted — live export was disconnected before it closed.*\n\n<!-- voyage-npc-chat:end:tick=${block.tick}:npc=${block.slug} -->\n\n`;
+      }
+
+      newContent = newContent.slice(0, orphanEnd) + leader + body + newContent.slice(orphanEnd);
+      changed = true;
+    }
+
+    return { content: newContent, dirty: changed };
   }
 
   // Live export listens to three event families:
