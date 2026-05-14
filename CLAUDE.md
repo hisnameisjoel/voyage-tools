@@ -62,9 +62,11 @@ The popup (`popup.js`) talks to `voyage-story-exporter.js` exclusively via `chro
 
 ## Live export persistence
 
-IndexedDB database `voyage-helper`, object store `storyHandles`. Records are keyed by `roomId` and shaped as `{ handle: FileSystemFileHandle, lastWrittenTick: number | null }`. `lastWrittenTick` is the highest turn tick already written; appends only write turns above that watermark.
+IndexedDB database `voyage-helper`, object store `storyHandles`. Records are keyed by `roomId` and shaped as `{ directoryHandle: FileSystemDirectoryHandle, filename: string, lastWrittenTick: number | null }`. The directory handle (not a file handle) is what's persisted — the file inside the folder is opened on demand via `directoryHandle.getFileHandle(filename, { create: true })`, which never truncates (unlike the previous file-handle flow via `showSaveFilePicker`, which Chrome on Windows pre-truncated). `lastWrittenTick` is the highest turn tick already written; appends only write turns above that watermark.
 
-Resume markers in the markdown file (`<!-- voyage-turn:tick=N -->`, `<!-- voyage-session:roomId=XXX -->`) allow parsing the watermark from the file itself when IDB has no record (e.g. after a `stop` or cross-device scenario).
+Pre-v1.1.0 records (`{ handle, lastWrittenTick }` with a file handle) are detected on load, deleted, and `loadRecord` returns null — the popup then falls through to "Configure live export" so users re-pick a folder once.
+
+Resume markers in the markdown file (`<!-- voyage-turn:tick=N -->`, `<!-- voyage-session:roomId=XXX -->`) allow parsing the watermark from the file itself when IDB has no record (e.g. after a `clearConfig` or cross-device scenario).
 
 ## Releasing a new version
 

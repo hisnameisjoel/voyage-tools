@@ -8,11 +8,9 @@
         color-scheme: dark;
       }
       body {
-        /* Chrome caps popup at 800w × 600h. Width is fixed (popups don't
-           auto-fit content horizontally); height auto-fits up to 600px,
-           then scrolls. Going wider than 320 lets the long labels in the
-           "Include in exports" list fit on one line, which saves ~22px per
-           wrapping checkbox — enough to keep us under the height cap. */
+        /* Chrome caps popup at 800w × 600h. With the export-option toggles
+           moved to the separate Configure window, the popup is now a focused
+           status + actions surface that fits comfortably at this width. */
         width: 400px;
         margin: 0;
         padding: 14px 18px 10px;
@@ -155,11 +153,6 @@
       .story-status .live-active {
         color: #ffd540;
       }
-      /* Pulsing dot signals "we're actively listening" while live export is
-         on. The polling rebuilds the status card every couple of seconds, so
-         the keyframe duration is tuned to ~match the poll interval — each
-         poll restarts the animation, but at that cadence the cycle is just
-         completing, so the eye reads it as continuous breathing. */
       .live-pulse {
         display: inline-block;
         animation: voyage-pulse 1.8s ease-in-out infinite;
@@ -219,6 +212,18 @@
       .action-btn.danger:hover:not(:disabled) {
         background: #3a2a30;
       }
+      .action-btn.full {
+        display: block;
+        width: 100%;
+        margin-top: 4px;
+      }
+      /* The bare `[hidden]` attribute (specificity 0,0,1) loses to
+         `.action-btn.full` (0,2,0), so we have to re-state the hide rule
+         at matching specificity. Same workaround already in place for
+         `.action-btn.primary` above. */
+      .action-btn.full[hidden] {
+        display: none;
+      }
       .story-tip {
         font-size: 11px;
         color: #8d909a;
@@ -241,38 +246,6 @@
       .story-filepath .filename {
         color: #c2c5cd;
         font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
-      }
-      .config-title {
-        font-size: 13px;
-        font-weight: 600;
-        color: #eaeaea;
-        letter-spacing: 0.2px;
-        margin: 18px 0 4px 0;
-      }
-      .toggles-note {
-        font-size: 11px;
-        color: #6e717a;
-        text-align: center;
-        margin: 10px 0 0 0;
-        padding-top: 10px;
-        border-top: 1px solid #262830;
-        line-height: 1.35;
-      }
-      .config-row {
-        display: flex;
-        align-items: center;
-        gap: 8px;
-        padding: 3px 0;
-        font-size: 12px;
-        cursor: pointer;
-      }
-      .config-row input[type="checkbox"] {
-        margin: 0;
-        accent-color: #ffd540;
-        flex-shrink: 0;
-      }
-      .config-row .config-label {
-        line-height: 1.3;
       }
     </style>
   </head>
@@ -323,39 +296,7 @@
       <div class="story-filepath" id="storyFilepath" hidden>Writing to: <span class="filename" id="storyFilename"></span></div>
       <div class="story-tip" id="storyTip" hidden></div>
 
-      <div class="config-title">Include in exports</div>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeInputs" />
-        <span class="config-label">Your typed actions &amp; dialogue</span>
-      </label>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeChecks" />
-        <span class="config-label">Skill check rolls and modifiers</span>
-      </label>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeStatus" />
-        <span class="config-label">Status updates (inventory, level-ups, resources)</span>
-      </label>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeNpcConversations" />
-        <span class="config-label">Full NPC conversations &amp; AI summary (live export only — can't be recovered after the turn rolls)</span>
-      </label>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeNpcChats" />
-        <span class="config-label">Compact NPC chat summaries (only used when full conversations is off)</span>
-      </label>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeCharacters" />
-        <span class="config-label">Characters in scene (per-turn cast list)</span>
-      </label>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeMusic" />
-        <span class="config-label">Music &amp; ambience cues</span>
-      </label>
-      <label class="config-row">
-        <input type="checkbox" id="storyIncludeMarkers" />
-        <span class="config-label">Live export resume markers (hidden comments needed to resume existing story documents.)</span>
-      </label>
+      <button type="button" class="action-btn full" id="configureExportBtn" hidden>Configure export options…</button>
     </div>
 
     <script src="popup.js"></script>

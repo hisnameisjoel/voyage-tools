@@ -6,25 +6,35 @@
  * performs the requested action:
  *
  *   getStatus           — returns current session info, live-export state,
- *                         turn count, and whether a stored handle exists,
- *                         so the popup can render its controls
+ *                         turn count, and whether a folder/filename config
+ *                         exists, so the popup can render its controls
  *   exportCurrentTurn   — one-shot blob download of the live in-progress turn
  *   exportWholeStory    — pulls full history, formats markdown, blob download
- *   startLiveExport     — receives a FileSystemFileHandle from the popup
- *                         (the popup hosts the showSaveFilePicker call so
- *                         the user-gesture requirement is satisfied), then:
- *                           - empty file       : write the full story, then
- *                                                append on each turn
- *                           - existing file    : parse for the last turn we
- *                                                already documented, append
- *                                                any missing turns, then
- *                                                continue appending live —
- *                                                never overwrites existing
- *                                                content the user may have
- *                                                authored / edited offline
- *   stopLiveExport      — clears state, removes the IDB record
- *   resumeLiveExport    — loads the saved handle, re-requests permission,
- *                         backfills anything missed, then appends new turns
+ *   configureLiveExport — receives a FileSystemDirectoryHandle + filename
+ *                         from the popup (via injected helper, since handles
+ *                         can't cross chrome.tabs.sendMessage). Validates,
+ *                         resolves the file inside the folder non-
+ *                         destructively, persists to IDB. Does NOT start
+ *                         writing — that's a separate Start click.
+ *   startLiveExport     — loads the saved directory handle + filename, opens
+ *                         the file inside the folder via
+ *                         `directoryHandle.getFileHandle(filename,
+ *                         { create: true })` (never truncates), then:
+ *                           - new/empty file : write the full story, then
+ *                                              append on each turn
+ *                           - existing file  : parse for the last turn we
+ *                                              already documented, append
+ *                                              any missing turns, then
+ *                                              continue appending live —
+ *                                              never overwrites existing
+ *                                              content the user may have
+ *                                              authored / edited offline
+ *   stopLiveExport      — clears in-memory state (pauses writing). Keeps
+ *                         the IDB config record so Start re-uses the same
+ *                         folder/filename without reconfiguring.
+ *   clearConfig         — forgets the folder/filename config for the
+ *                         current campaign. Forces a re-Configure on next
+ *                         use.
  *
  * Resume markers: every turn's markdown is preceded by an HTML comment
  *   <!-- voyage-turn:tick=N -->
@@ -221,16 +231,23 @@
   }
 
   // ---------- IndexedDB for FileSystemHandle + state persistence ----------
-  // We store { handle, lastWrittenTick } per roomId so a reload can resume
-  // append-only writing exactly where the previous session left off. File
-  // handles survive structured cloning into IDB; the browser still requires
-  // user-gesture permission re-grant on restart (one click), but a stored
-  // handle is what lets us offer "Resume" instead of re-picking the file.
+  // We store { directoryHandle, filename, lastWrittenTick } per roomId so a
+  // reload can resume append-only writing exactly where the previous session
+  // left off. Directory handles survive structured cloning into IDB; the
+  // browser still requires user-gesture permission re-grant on restart (one
+  // click via Start), but a stored handle is what lets us offer a no-picker
+  // resume.
   //
-  // Backwards-compat: v1.5.0 / v1.5.1 stored a bare handle under the same
-  // store. loadRecord transparently upgrades that to { handle, lastWrittenTick: null }
-  // so a user reloading after upgrade gets a polite first re-pick instead of
-  // a hard error.
+  // Why a *directory* handle and not a file handle: on Windows, the OS Save
+  // As dialog that backs `showSaveFilePicker` pre-truncates the picked file's
+  // contents before our code can read them. Picking a folder side-steps that
+  // entirely — `directoryHandle.getFileHandle(filename, { create: true })`
+  // never truncates.
+  //
+  // Backwards-compat: pre-1.1.0 records used { handle, lastWrittenTick } with
+  // a file handle. loadRecord detects those, deletes them, and returns null
+  // so the popup falls through to "Configure live export" — the user
+  // re-picks via the new folder-based flow once and is set.
   const DB_NAME = 'voyage-helper';
   const DB_STORE = 'storyHandles';
 
@@ -262,22 +279,32 @@
   }
   async function loadRecord(key) {
     const db = await openDb();
-    return new Promise((resolve) => {
+    const v = await new Promise((resolve) => {
       const tx = db.transaction(DB_STORE, 'readonly');
       const r = tx.objectStore(DB_STORE).get(key);
-      r.onsuccess = () => {
-        const v = r.result;
-        if (!v) return resolve(null);
-        // Normalize: either { handle, lastWrittenTick } or a bare handle from
-        // a pre-1.5.2 install.
-        if (v.handle && typeof v.handle === 'object') {
-          resolve({ handle: v.handle, lastWrittenTick: v.lastWrittenTick ?? null });
-        } else {
-          resolve({ handle: v, lastWrittenTick: null });
-        }
-      };
+      r.onsuccess = () => resolve(r.result);
       r.onerror = () => resolve(null);
     });
+    if (!v) return null;
+    // New shape: { directoryHandle, filename, lastWrittenTick }.
+    if (v.directoryHandle && typeof v.directoryHandle === 'object' && typeof v.filename === 'string') {
+      return {
+        directoryHandle: v.directoryHandle,
+        filename: v.filename,
+        lastWrittenTick: v.lastWrittenTick ?? null,
+      };
+    }
+    // Legacy shape (file handle, pre-1.1.0): incompatible. Delete and
+    // return null so the popup shows "Configure live export" instead.
+    // Properly await the delete so a subsequent loadRecord can't re-encounter
+    // the legacy entry; log if it fails so the migration silent-failure
+    // mode is visible.
+    try {
+      await removeRecord(key);
+    } catch (e) {
+      console.warn('[voyage-story] failed to delete legacy IDB record:', e);
+    }
+    return null;
   }
   // ---------- Per-room filename memory ----------
   // Lets the file picker default to whatever name the user picked last time
@@ -358,9 +385,22 @@
   }
   async function persistLiveExport() {
     if (!liveExport) return;
+    if (!liveExport.directoryHandle || !liveExport.filename) {
+      // Defensive: liveExport must always carry its directory handle and
+      // filename now. If it doesn't, the in-memory state has diverged from
+      // the IDB record — silently skipping the save would let writes
+      // continue against `liveExport.handle` while IDB believes a stale
+      // record. Halt loudly so the divergence can't compound.
+      console.error('[voyage-story] persistLiveExport: liveExport is missing directoryHandle/filename — halting');
+      setStatus('Internal state error — stop and reconfigure live export.');
+      liveExport = null;
+      notifyBadge(false);
+      return;
+    }
     try {
       await saveRecord(liveExport.roomId, {
-        handle: liveExport.handle,
+        directoryHandle: liveExport.directoryHandle,
+        filename: liveExport.filename,
         lastWrittenTick: liveExport.lastWrittenTick,
       });
     } catch (e) {
@@ -903,6 +943,91 @@
     return m ? m[1] : null;
   }
 
+  // ---------- Filename validation and directory-handle file resolution ----------
+  // Reserved on Windows; rejected case-insensitively whether or not there's an
+  // extension (`CON`, `con.md`, `CON.txt` — all blocked). NUL byte rejected
+  // unconditionally. Trailing dots/spaces are stripped before the check
+  // because Windows can't have them in filenames either.
+  const RESERVED_WIN_NAMES = /^(CON|PRN|AUX|NUL|COM[1-9]|LPT[1-9])(\.|$)/i;
+  function normalizeFilename(raw) {
+    let name = String(raw || '').trim();
+    if (!name) return { ok: false, message: 'Filename is empty.' };
+    // Strip trailing dots/spaces — Windows silently does this and we don't
+    // want the IDB record to disagree with what's actually on disk.
+    name = name.replace(/[. ]+$/, '');
+    if (!name) return { ok: false, message: 'Filename is empty after trimming.' };
+    if (/[\\/:*?"<>|\x00]/.test(name)) {
+      return { ok: false, message: 'Filename contains an illegal character (\\ / : * ? " < > |).' };
+    }
+    if (RESERVED_WIN_NAMES.test(name)) {
+      return { ok: false, message: `"${name}" is a reserved Windows filename.` };
+    }
+    if (!/\.md$/i.test(name)) name += '.md';
+    // Reject ".md" with no stem — would be a hidden file on Unix and an
+    // invalid file on Windows. Anything one char longer ("a.md") is fine.
+    if (/^\.md$/i.test(name)) return { ok: false, message: 'Filename must have a name before ".md".' };
+    if (name.length > 255) return { ok: false, message: 'Filename is too long (max 255 characters).' };
+    return { ok: true, filename: name };
+  }
+
+  // Given a directory handle, a filename, and the current campaign's roomId,
+  // open the file inside the directory non-destructively and return whether
+  // the file was created (empty) or resumed (existing). Enforces the session-
+  // marker mismatch check: if the file already exists and has a different
+  // roomId marker, we refuse and surface a clear error to the caller.
+  //
+  // Returns:
+  //   { ok: true,  fileHandle, created: false, existingContent, parsedTick }   // resumed
+  //   { ok: true,  fileHandle, created: true,  existingContent: '' }            // new file
+  //   { ok: false, mismatch: true, fileRoomId, message }                        // session mismatch
+  //   { ok: false, message }                                                    // any other error
+  async function resolveFileHandle(directoryHandle, filename, expectedRoomId) {
+    if (!directoryHandle || typeof directoryHandle.getFileHandle !== 'function') {
+      return { ok: false, message: 'Directory handle is invalid. Reconfigure live export.' };
+    }
+    let fileHandle = null;
+    let created = false;
+    try {
+      fileHandle = await directoryHandle.getFileHandle(filename, { create: false });
+    } catch (e) {
+      // getFileHandle throws DOMException with name 'NotFoundError' when the
+      // file doesn't exist. Anything else is a real failure.
+      if (e?.name !== 'NotFoundError') {
+        return { ok: false, message: `Couldn't open file in folder: ${e?.message || e?.name || 'unknown error'}.` };
+      }
+      try {
+        fileHandle = await directoryHandle.getFileHandle(filename, { create: true });
+        created = true;
+      } catch (e2) {
+        return { ok: false, message: `Couldn't create file in folder: ${e2?.message || e2?.name || 'unknown error'}.` };
+      }
+    }
+    if (created) {
+      return { ok: true, fileHandle, created: true, existingContent: '' };
+    }
+    let text = '';
+    try {
+      const f = await fileHandle.getFile();
+      if (f.size > 0) text = await f.text();
+    } catch (e) {
+      return { ok: false, message: `Couldn't read file in folder: ${e?.message || e?.name || 'unknown error'}.` };
+    }
+    if (text) {
+      const fileRoomId = parseSessionRoomId(text);
+      if (fileRoomId && expectedRoomId && fileRoomId !== expectedRoomId) {
+        return {
+          ok: false, mismatch: true, fileRoomId,
+          message: `That folder already has "${filename}" but it belongs to a different campaign. Pick a different folder or filename.`,
+        };
+      }
+    }
+    const parsed = parseLastTickInFile(text);
+    return {
+      ok: true, fileHandle, created: false,
+      existingContent: text, parsedTick: parsed.tick,
+    };
+  }
+
   // NPC chat block markers — emitted by pushChat when live export is active.
   // Slug captures alphanumeric+underscore (the output of slugifyNpcName), so
   // the regex is strict enough that random `<!-- something -->` comments in
@@ -1012,262 +1137,226 @@
     return startMarkerIdx + searchStart + endRel;
   }
 
-  // Receives a FileSystemFileHandle (and roomId) from the popup, which has
-  // already invoked showSaveFilePicker under its own user gesture.
+  // Persist the directory handle + filename to IDB without starting the live
+  // export. Called by the popup's "Configure" flow via the isolated-world
+  // helper (handles can't cross chrome.tabs.sendMessage with their methods
+  // intact, so configuration happens in this script's context).
   //
-  // Three outcomes:
-  //   - Empty file (brand-new pick or zero-byte file) → write the full story
-  //     so the user lands "caught up" before live appends begin.
-  //   - Existing Voyage export (markers or parseable turn headings) → parse
-  //     for the highest documented tick and append only newer turns. Never
-  //     overwrites existing content (the user may have edited prior turns).
-  //   - Anything else (random markdown, mismatched campaign, unreadable
-  //     file) → bail with a clear status message. We never set liveExport
-  //     state for a failed start, so the popup can't show "active" while
-  //     writes are failing.
-  async function startLiveExport(handle) {
+  // The roomId is re-fetched from the cache rather than taken as an argument
+  // so we can't accidentally persist a config under the wrong room.
+  //
+  // Returns one of:
+  //   { ok: true, created: true, filename }
+  //   { ok: true, created: false, filename, parsedTick }
+  //   { ok: false, mismatch: true, message }
+  //   { ok: false, message }
+  async function configureLiveExport(directoryHandle, filenameRaw) {
+    const trace = newTraceId('configure');
+    const normalized = normalizeFilename(filenameRaw);
+    if (!normalized.ok) {
+      dbg(trace, 'abort', { reason: 'invalid filename', message: normalized.message });
+      return { ok: false, message: normalized.message };
+    }
+    const filename = normalized.filename;
+    const snap = await callMain('getSnapshot').catch(() => null);
+    if (!snap?.roomId) {
+      dbg(trace, 'abort', { reason: 'no roomId in snapshot' });
+      return { ok: false, message: 'Wait for the campaign to finish loading on the page, then try again.' };
+    }
+
+    // Rename-only flow: caller passes directoryHandle=null when the user
+    // changes just the filename without re-picking the folder. Look up the
+    // stored handle from IDB and reuse it. If there's no stored config,
+    // we have nothing to reuse — surface a clear "pick a folder first"
+    // error instead of silently behaving like a fresh configure.
+    let effectiveDir = directoryHandle;
+    if (!effectiveDir) {
+      const record = await loadRecord(snap.roomId);
+      if (!record?.directoryHandle) {
+        dbg(trace, 'abort', { reason: 'rename-only with no stored handle' });
+        return { ok: false, message: 'No folder picked yet. Click "Pick export folder" first.' };
+      }
+      effectiveDir = record.directoryHandle;
+      dbg(trace, 'rename-only: reusing stored handle', { folder: effectiveDir.name });
+    } else if (typeof effectiveDir.getFileHandle !== 'function') {
+      dbg(trace, 'abort', { reason: 'invalid directoryHandle' });
+      return { ok: false, message: 'Invalid folder handle.' };
+    }
+
+    const granted = await ensureHandlePermission(effectiveDir);
+    if (!granted) {
+      dbg(trace, 'abort', { reason: 'permission denied' });
+      return { ok: false, message: 'Permission to read/write the folder was denied.' };
+    }
+    const resolved = await resolveFileHandle(effectiveDir, filename, snap.roomId);
+    if (!resolved.ok) {
+      dbg(trace, 'abort', { reason: 'resolve failed', message: resolved.message, mismatch: resolved.mismatch });
+      return resolved;
+    }
+    try {
+      await saveRecord(snap.roomId, {
+        directoryHandle: effectiveDir,
+        filename,
+        // Seed lastWrittenTick from file watermark so the first Start after a
+        // configure-against-existing-file resumes cleanly. For new files this
+        // is null and initialWrite will compute it.
+        lastWrittenTick: resolved.created ? null : (resolved.parsedTick ?? null),
+      });
+      rememberFilename(snap.roomId, filename);
+      storedHandleRoomId = snap.roomId;
+    } catch (e) {
+      dbg(trace, 'abort', { reason: 'persist failed', message: e?.message });
+      return { ok: false, message: `Couldn't save configuration: ${e?.message || e?.name || 'unknown error'}.` };
+    }
+    dbg(trace, 'done', { created: resolved.created, filename, parsedTick: resolved.parsedTick });
+    return {
+      ok: true,
+      created: resolved.created,
+      filename,
+      folderName: effectiveDir.name,
+      parsedTick: resolved.parsedTick ?? null,
+    };
+  }
+
+  // Explicitly forget the live-export configuration for the current campaign.
+  // Removes the IDB record and the remembered-filename hint. Surfaces any
+  // failure so a "cleared" status doesn't lie about a record that's still
+  // in IDB.
+  async function clearConfig() {
+    const snap = await callMain('getSnapshot').catch(() => null);
+    if (!snap?.roomId) return { ok: false, message: 'No campaign loaded.' };
+    const failures = [];
+    try { await removeRecord(snap.roomId); }
+    catch (e) { failures.push(`IDB: ${e?.message || e?.name || 'unknown'}`); }
+    try { chrome.storage.local.remove(FILENAME_KEY_PREFIX + snap.roomId); }
+    catch (e) { failures.push(`storage: ${e?.message || e?.name || 'unknown'}`); }
+    if (storedHandleRoomId === snap.roomId) storedHandleRoomId = null;
+    if (failures.length) {
+      return { ok: false, message: `Couldn't fully clear configuration: ${failures.join('; ')}.` };
+    }
+    return { ok: true };
+  }
+
+  // Unified start. No arguments — config must already be in IDB (set via
+  // configureLiveExport). Reads config, ensures permission on the directory,
+  // resolves the file inside it, runs the existing preservation flow.
+  async function startLiveExport() {
     const trace = newTraceId('start');
-    dbg(trace, 'start', { filename: handle?.name });
-    if (!handle) {
-      setStatus('Internal error: no file handle.');
-      return { ok: false, message: 'no handle' };
-    }
-    if (typeof handle.createWritable !== 'function' || typeof handle.getFile !== 'function') {
-      setStatus('Internal error: the file handle is missing its methods. Reload the Voyage tab and try again.');
-      return { ok: false, message: 'handle methods missing' };
-    }
+    dbg(trace, 'start');
     const snap = await callMain('getSnapshot');
     if (!snap.roomId) {
       setStatus('Wait for the room to finish loading before starting live export.');
       dbg(trace, 'abort', { reason: 'no roomId' });
       return { ok: false, message: 'room not ready' };
     }
-    let existing;
-    try {
-      const f = await handle.getFile();
-      existing = await f.text();
-      dbg(trace, 'file read', { bytes: f.size, summary: summarizeContent(existing) });
-    } catch (e) {
-      setStatus(`Couldn't read the picked file: ${e.message || e.name || 'unknown error'}. Pick a different file.`);
-      dbg(trace, 'abort', { reason: 'file read failed', message: e?.message });
-      return { ok: false, message: 'read failed: ' + (e.message || e.name) };
+    const record = await loadRecord(snap.roomId);
+    if (!record) {
+      dbg(trace, 'abort', { reason: 'no config' });
+      return { ok: false, message: 'no configuration — click Configure live export first' };
     }
-
-    // Empty file → fresh export. Safe to do the full initial write.
-    if (!existing.trim()) {
-      liveExport = {
-        handle,
-        roomId: snap.roomId,
-        lastWrittenTick: null,
-        debounceTimer: null,
-        chatDebounceTimer: null,
-        writtenChatState: new Map(),
-      };
-      storedHandleRoomId = snap.roomId;
-      rememberFilename(snap.roomId, handle.name);
-      notifyBadge(true);
-      setStatus('Live export active. Backfilling history…');
-      await initialWrite();
-      // initialWrite tears down liveExport on failure; reflect that result.
-      return liveExport
-        ? { ok: true, mode: 'fresh' }
-        : { ok: false, message: 'initial write failed' };
+    dbg(trace, 'record loaded', {
+      roomId: snap.roomId,
+      filename: record.filename,
+      folder: record.directoryHandle?.name,
+      lastWrittenTick: record.lastWrittenTick,
+    });
+    const granted = await ensureHandlePermission(record.directoryHandle);
+    if (!granted) {
+      setStatus('Permission denied for the saved folder.');
+      dbg(trace, 'abort', { reason: 'permission denied' });
+      return { ok: false, message: 'permission denied' };
     }
-
-    // Non-empty. Must be a recognizable Voyage export, and (if it identifies
-    // a campaign) must match the current one.
-    const fileRoomId = parseSessionRoomId(existing);
-    if (fileRoomId && fileRoomId !== snap.roomId) {
-      setStatus("That file is from a different Voyage campaign. Pick a different file or an empty one.");
-      return { ok: false, message: 'session mismatch', fileRoomId };
+    const resolved = await resolveFileHandle(record.directoryHandle, record.filename, snap.roomId);
+    if (!resolved.ok) {
+      dbg(trace, 'abort', { reason: 'resolve failed', message: resolved.message, mismatch: resolved.mismatch });
+      setStatus(resolved.message);
+      return resolved;
     }
-
-    const parsed = parseLastTickInFile(existing);
-    if (parsed.tick == null) {
-      setStatus("That file doesn't look like a Voyage export. Pick an empty file, or click 'Whole story' to start a fresh export.");
-      return { ok: false, message: 'unparseable' };
-    }
+    dbg(trace, 'file resolved', {
+      created: resolved.created,
+      parsedTick: resolved.parsedTick,
+      contentBytes: resolved.existingContent?.length || 0,
+    });
 
     liveExport = {
-      handle,
+      handle: resolved.fileHandle,
+      directoryHandle: record.directoryHandle,
+      filename: record.filename,
       roomId: snap.roomId,
-      lastWrittenTick: parsed.tick,
+      // Prefer IDB watermark; fall back to file-derived watermark from
+      // resolveFileHandle for first-resume into a hand-edited existing file.
+      lastWrittenTick: record.lastWrittenTick ?? resolved.parsedTick ?? null,
       debounceTimer: null,
       chatDebounceTimer: null,
       writtenChatState: new Map(),
     };
     storedHandleRoomId = snap.roomId;
-    rememberFilename(snap.roomId, handle.name);
     notifyBadge(true);
-    // Pre-sync cleanup: close any orphan chat blocks in the file (e.g.
-    // chats left open by a crashed prior session) before we seed the
-    // writtenChatState. Without this, seedWrittenChatStateFromFile would
-    // see only the half-written orphan and the live writer could end up
-    // emitting duplicate content past it.
+
+    // Brand-new file → initialWrite path. Cache produces the full backfill.
+    if (resolved.created || !resolved.existingContent.trim()) {
+      setStatus('Live export active. Backfilling history…');
+      await initialWrite();
+      return liveExport
+        ? { ok: true, mode: 'fresh' }
+        : { ok: false, message: 'initial write failed' };
+    }
+
+    // Existing file → preservation flow. Run cleanup, seed writtenChatState
+    // from file markers, then catch up new turns.
     syncPhase = 'Cleaning up interrupted chats…';
-    const { content: cleaned } = await preSyncCleanupChatBlocks(existing, snap);
-    if (cleaned !== existing) {
-      await writeToHandle(handle, cleaned, 'startLiveExport:preSyncCleanup');
+    const { content: cleaned, dirty } = await preSyncCleanupChatBlocks(resolved.existingContent, snap);
+    if (dirty) {
+      try {
+        await writeToHandle(liveExport.handle, cleaned, 'startLiveExport:preSyncCleanup');
+      } catch (e) {
+        // The cleanup write decided the file needed orphan-chat repairs.
+        // If we proceed past a failed write, the file still has orphan
+        // blocks but writtenChatState would be seeded from the *intended*
+        // post-cleanup buffer — subsequent live writes would mismatch
+        // what's on disk, exactly the silent-divergence bug class the
+        // v1.0.3-1.0.5 fixes were chasing. Abort loudly instead.
+        console.error('[voyage-story] preSyncCleanup write failed:', e);
+        syncPhase = null;
+        setStatus(`Couldn't repair interrupted chats: ${e?.message || e?.name || 'unknown error'}. Live export not started.`);
+        liveExport = null;
+        notifyBadge(false);
+        dbg(trace, 'abort', { reason: 'preSyncCleanup write failed', message: e?.message });
+        return { ok: false, message: 'preSyncCleanup write failed: ' + (e?.message || e?.name || 'unknown') };
+      }
     }
     seedWrittenChatStateFromFile(cleaned, snap, liveExport.writtenChatState);
+    dbg(trace, 'seeded writtenChatState', { entries: liveExport.writtenChatState.size });
+
     syncPhase = 'Fetching history…';
     await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
     syncPhase = 'Backfilling characters…';
     await backfillCharactersInFile();
     syncPhase = 'Writing missing turns…';
     await appendNewTurns();
-    // appendNewTurns persists only when it actually wrote something; make
-    // sure the handle + tick land in IDB even if there was nothing new.
     await persistLiveExport();
     syncPhase = null;
     const finalSnap = await callMain('getSnapshot');
     const count = finalSnap?.turns?.length || 0;
     syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
     setStatus('');
-    return { ok: true, mode: 'resumed', resumedFromTick: parsed.tick };
+    dbg(trace, 'done', { mode: 'resumed', resumedFromTick: liveExport.lastWrittenTick, count });
+    return { ok: true, mode: 'resumed', resumedFromTick: liveExport.lastWrittenTick };
   }
 
-  // opts.preserveRecord (default false): keep the IDB record so the popup
-  // can offer "Resume live export" next time the user enters this campaign.
-  // Used by the auto-stop-on-campaign-switch path; manual stops clear it.
-  async function stopLiveExport(opts = {}) {
-    const { preserveRecord = false } = opts;
+  // Stop preserves the IDB config record. Stop = "pause writing"; the
+  // config is forgotten only via clearConfig (popup's "Clear configuration"
+  // link).
+  async function stopLiveExport() {
     syncPhase = null;
     syncCompleteMsg = null;
     if (liveExport) {
       clearTimeout(liveExport.debounceTimer);
       clearTimeout(liveExport.chatDebounceTimer);
-      const roomId = liveExport.roomId;
       liveExport = null;
       notifyBadge(false);
-      if (!preserveRecord) {
-        try { await removeRecord(roomId); } catch {}
-        if (storedHandleRoomId === roomId) storedHandleRoomId = null;
-      }
     }
     setStatus('Live export stopped.');
-    return { ok: true };
-  }
-
-  async function resumeLiveExport() {
-    const trace = newTraceId('resume');
-    dbg(trace, 'start');
-    const snap = await callMain('getSnapshot');
-    if (!snap.roomId) {
-      setStatus('Wait for the room to finish loading.');
-      dbg(trace, 'abort', { reason: 'no roomId in snapshot' });
-      return { ok: false, message: 'room not ready' };
-    }
-    const record = await loadRecord(snap.roomId);
-    if (!record) {
-      dbg(trace, 'abort', { reason: 'no IDB record for room', roomId: snap.roomId });
-      return { ok: false, message: 'no stored handle for this room — pick a file first' };
-    }
-    dbg(trace, 'record loaded', {
-      roomId: snap.roomId,
-      recordLastWrittenTick: record.lastWrittenTick,
-      filename: record.handle?.name,
-      snapTurns: (snap.turns || []).length,
-      snapNpcChats: (snap.npcChats || []).length,
-    });
-    const ok = await ensureHandlePermission(record.handle);
-    if (!ok) {
-      setStatus('Permission denied for the saved file.');
-      dbg(trace, 'abort', { reason: 'permission denied' });
-      return { ok: false, message: 'permission denied' };
-    }
-    liveExport = {
-      handle: record.handle,
-      roomId: snap.roomId,
-      lastWrittenTick: record.lastWrittenTick ?? null,
-      debounceTimer: null,
-      chatDebounceTimer: null,
-      writtenChatState: new Map(),
-    };
-    storedHandleRoomId = snap.roomId;
-    rememberFilename(snap.roomId, record.handle?.name);
-    notifyBadge(true);
-
-    // Read the file once up front. We use it for three things in order:
-    //   1. Pre-sync cleanup: close any orphan NPC chat blocks left open by a
-    //      crashed prior session, so the file is structurally complete before
-    //      any further writes.
-    //   2. Seed writtenChatState from file markers (the only reliable source
-    //      of truth for what's actually on disk — server-side chat history
-    //      gets wiped after each turn commit).
-    //   3. Fall back to file-derived watermark when IDB has none (pre-1.5.2
-    //      installs, or any future state-loss scenario).
-    let existing = '';
-    try {
-      const f = await liveExport.handle.getFile();
-      if (f.size > 0) existing = await f.text();
-      dbg(trace, 'file read', { bytes: f.size, summary: summarizeContent(existing) });
-    } catch (e) {
-      dbg(trace, 'file read failed', { message: e?.message });
-    }
-
-    syncPhase = 'Cleaning up interrupted chats…';
-    const { content: cleaned, dirty } = await preSyncCleanupChatBlocks(existing, snap);
-    if (dirty) {
-      try { await writeToHandle(liveExport.handle, cleaned, 'resumeLiveExport:preSyncCleanup'); }
-      catch (e) { console.warn('[voyage-story] preSyncCleanup write failed:', e); }
-    }
-    seedWrittenChatStateFromFile(cleaned, snap, liveExport.writtenChatState);
-    dbg(trace, 'seeded writtenChatState', { entries: liveExport.writtenChatState.size });
-
-    // The file is now structurally clean. Decide how to proceed based on
-    // whether we have a turn watermark.
-    if (liveExport.lastWrittenTick == null) {
-      let fileWatermark = null;
-      if (cleaned) {
-        const parsed = parseLastTickInFile(cleaned);
-        if (parsed.tick != null) fileWatermark = parsed.tick;
-      }
-      if (fileWatermark != null) {
-        liveExport.lastWrittenTick = fileWatermark;
-        dbg(trace, 'using file watermark', { fileWatermark });
-        syncPhase = 'Fetching history…';
-        await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
-        syncPhase = 'Backfilling characters…';
-        await backfillCharactersInFile();
-        syncPhase = 'Writing missing turns…';
-        await appendNewTurns();
-        await persistLiveExport();
-        syncPhase = null;
-        const finalSnap = await callMain('getSnapshot');
-        const count = finalSnap?.turns?.length || 0;
-        syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
-        setStatus('');
-        dbg(trace, 'done', { mode: 'watermark-from-file', count });
-      } else if (cleaned.trim().length > 0) {
-        // File has content but no parseable turn structure. Refusing
-        // initialWrite here is the last line of defense against the
-        // destructive overwrite path — we'd rather force the user to
-        // pick a different file than silently shred their content.
-        syncPhase = null;
-        setStatus("Stored file has unrecognizable content. Stop live export and pick a different file, or clear this one.");
-        liveExport = null;
-        notifyBadge(false);
-        return { ok: false, message: 'unrecognizable existing content — refusing to overwrite' };
-      } else {
-        // syncPhase lifecycle is managed inside initialWrite
-        await initialWrite();
-      }
-    } else {
-      dbg(trace, 'using IDB watermark', { recordLastWrittenTick: liveExport.lastWrittenTick });
-      syncPhase = 'Fetching history…';
-      await callMain('pullAllHistory', { count: 10 }, 5 * 60 * 1000).catch(() => {});
-      syncPhase = 'Backfilling characters…';
-      await backfillCharactersInFile();
-      syncPhase = 'Writing missing turns…';
-      await appendNewTurns();
-      syncPhase = null;
-      const finalSnap = await callMain('getSnapshot');
-      const count = finalSnap?.turns?.length || 0;
-      syncCompleteMsg = `Sync complete — ${count} turn${count === 1 ? '' : 's'} up to date`;
-      setStatus('');
-      dbg(trace, 'done', { mode: 'watermark-from-IDB', count });
-    }
     return { ok: true };
   }
 
@@ -1300,15 +1389,12 @@
       syncPhase = null;
       console.error('[voyage-story] initialWrite:', e);
       // The first write failed — "live export active" would be a lie. Clear
-      // state so the popup falls back to "Start live export" instead of
-      // showing a contradictory "active + error" status.
-      setStatus(`Couldn't write to the picked file: ${e.message || e.name || 'unknown error'}.`);
+      // the in-memory state so the popup falls back to "Start live export"
+      // instead of showing a contradictory "active + error" status. Keep
+      // the IDB config record so the user can retry without reconfiguring.
+      setStatus(`Couldn't write to the file: ${e.message || e.name || 'unknown error'}.`);
       liveExport = null;
       notifyBadge(false);
-      if (storedHandleRoomId) {
-        try { await removeRecord(storedHandleRoomId); } catch {}
-        storedHandleRoomId = null;
-      }
     }
   }
 
@@ -1466,6 +1552,11 @@
           inSummary, outSummary,
         });
         dbg(trace, 'abort:would-drop-markers', { inSummary, outSummary });
+        // Surface to the popup so the user knows a write was refused. The
+        // refusal itself is the right behavior (it's protecting against
+        // data loss), but a silent refusal would let the user think
+        // backfill succeeded when it didn't.
+        setStatus('Refused Characters backfill — open DevTools console for details.', 8000);
         return;
       }
       dbg(trace, 'writing', {
@@ -1628,6 +1719,7 @@
         console.error('[voyage-story] rewriteTurnInFile: refusing to write — would drop markers or chat headings', {
           tick, inSummary, outSummary, startIdx, endIdx,
         });
+        setStatus(`Refused narrator-rewrite of turn ${tick} — open DevTools console for details.`, 8000);
         return;
       }
       dbg('rewriteTurnInFile', {
@@ -1788,6 +1880,7 @@
         inSummary, outSummary,
       });
       dbg(trace, 'abort:would-drop-markers', { inSummary, outSummary, orphanDecisions });
+      setStatus('Refused chat-cleanup write — open DevTools console for details.', 8000);
       return { content, dirty: false };
     }
     dbg(trace, 'done', { changed, inSummary, outSummary, orphanDecisions });
@@ -1834,9 +1927,8 @@
   // immediately on roomId mismatch so the file is preserved as-of the
   // moment the user left.
   //
-  // preserveRecord: keep the IDB record so when the user re-enters this
-  // campaign, the popup automatically shows "Resume live export…" pointing
-  // at the same file (no need to re-pick).
+  // stopLiveExport always preserves the IDB config record now, so returning
+  // to the original campaign just shows Start (no reconfigure needed).
   async function maybeAutoStopOnCampaignSwitch() {
     if (!liveExport) return;
     let snap;
@@ -1847,15 +1939,35 @@
     const nowIn = snap?.roomId;
     if (!nowIn || nowIn === startedFor) return;
     setStatus(`Live export paused — left the campaign. Return to resume.`);
-    await stopLiveExport({ preserveRecord: true }).catch(() => {});
+    await stopLiveExport().catch(() => {});
   }
 
   // ---------- Status state (polled by popup) ----------
   let lastStatusMessage = '';
   let lastStatusAt = 0;
-  function setStatus(text) {
-    lastStatusMessage = String(text || '');
+  // setStatus(text, ttlMs?) — sets the popup status message. If ttlMs is
+  // provided and > 0, the message auto-clears after that many milliseconds
+  // (the popup's 30-second visibility window still caps the maximum
+  // display time, but a shorter ttlMs lets transient messages disappear
+  // sooner so longer-lived state doesn't get hidden behind them).
+  let statusClearTimer = null;
+  function setStatus(text, ttlMs) {
+    if (statusClearTimer) {
+      clearTimeout(statusClearTimer);
+      statusClearTimer = null;
+    }
+    const value = String(text || '');
+    lastStatusMessage = value;
     lastStatusAt = Date.now();
+    if (typeof ttlMs === 'number' && ttlMs > 0) {
+      statusClearTimer = setTimeout(() => {
+        if (lastStatusMessage === value) {
+          lastStatusMessage = '';
+          lastStatusAt = Date.now();
+        }
+        statusClearTimer = null;
+      }, ttlMs);
+    }
   }
 
   // ---------- Background history fetch ----------
@@ -1901,20 +2013,22 @@
     if (snap?.roomId) ensureBackgroundHistoryFetch();
 
     const roomId = snap?.roomId || null;
-    let hasStoredHandle = false;
+    let hasConfig = false;
+    let configFolderName = null;
+    let configFilename = null;
     if (roomId) {
       try {
         const record = await loadRecord(roomId);
         if (record) {
-          hasStoredHandle = true;
+          hasConfig = true;
+          configFolderName = record.directoryHandle?.name || null;
+          configFilename = record.filename || null;
           if (storedHandleRoomId !== roomId) storedHandleRoomId = roomId;
         }
       } catch {}
     }
-    // Prefer the last-picked filename for this campaign if we have one;
-    // otherwise fall back to the auto-generated default. Either way, this
-    // becomes the picker's `suggestedName` on a fresh Start so the user
-    // doesn't have to retype the same name they used last session.
+    // The configure subpage's filename input pre-fills with: remembered
+    // filename for this room, or the auto-generated canonical default.
     const remembered = await recallFilename(roomId);
     const suggestedFilename = remembered || defaultFilename(snap?.session);
     return {
@@ -1931,19 +2045,19 @@
             active: true,
             roomId: liveExport.roomId,
             lastWrittenTick: liveExport.lastWrittenTick,
-            // FileSystemFileHandle exposes the filename but never the
-            // absolute path (security). That's enough to confirm the user
-            // is writing to the file they intended.
-            filename: liveExport.handle?.name || null,
+            filename: liveExport.filename || liveExport.handle?.name || null,
+            folderName: liveExport.directoryHandle?.name || null,
           }
         : { active: false },
-      hasStoredHandle,
+      hasConfig,
+      configFolderName,
+      configFilename,
       suggestedFilename,
       syncPhase,
       syncCompleteMsg,
       lastStatus: lastStatusMessage,
       lastStatusAt,
-      filePickerSupported: typeof window.showSaveFilePicker === 'function',
+      directoryPickerSupported: typeof window.showDirectoryPicker === 'function',
     };
   }
 
@@ -1962,11 +2076,11 @@
           case 'exportWholeStory':
             return respond(await exportWholeStory());
           case 'startLiveExport':
-            return respond(await startLiveExport(msg.handle));
+            return respond(await startLiveExport());
           case 'stopLiveExport':
             return respond(await stopLiveExport());
-          case 'resumeLiveExport':
-            return respond(await resumeLiveExport());
+          case 'clearConfig':
+            return respond(await clearConfig());
           default:
             return respond({ ok: false, message: 'unknown action: ' + msg.action });
         }
@@ -2038,7 +2152,18 @@
     try { console.log('[voyage-story] verbose debug logging', DEBUG_LOG ? 'enabled' : 'disabled'); } catch {}
     return DEBUG_LOG;
   }
-  window.__voyageStoryHelper = { startLiveExport, dumpState, setDebug };
+  // The popup's "Pick folder" button injects a function into this isolated
+  // world that calls `configureLiveExport(directoryHandle, filename)` after
+  // running `showDirectoryPicker`. The handle never crosses
+  // chrome.tabs.sendMessage (which strips its methods), so configuration
+  // happens entirely inside this script's context.
+  window.__voyageStoryHelper = {
+    configureLiveExport,
+    clearConfig,
+    startLiveExport,
+    dumpState,
+    setDebug,
+  };
 
   // ---------- Lifecycle ----------
   // No page UI to manage — just load config and let messages drive everything.

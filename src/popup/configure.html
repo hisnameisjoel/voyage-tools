@@ -1,0 +1,319 @@
+<!doctype html>
+<html lang="en">
+  <head>
+    <meta charset="utf-8" />
+    <title>Configure live export · Voyage Tools</title>
+    <style>
+      :root {
+        color-scheme: dark;
+      }
+      /* The configure page lives in a regular browser tab, so the viewport
+         can be arbitrarily wide. We paint the dark theme on <html> so the
+         tab background is consistent, then constrain the body to a popup-
+         like width and center it. */
+      html {
+        background: #181a20;
+        min-height: 100vh;
+      }
+      body {
+        max-width: 480px;
+        box-sizing: border-box;
+        margin: 0 auto;
+        padding: 16px 20px 14px;
+        font-family: system-ui, -apple-system, "Segoe UI", sans-serif;
+        background: #181a20;
+        color: #eaeaea;
+      }
+      header {
+        display: flex;
+        align-items: center;
+        gap: 10px;
+        margin-bottom: 4px;
+      }
+      header img {
+        width: 28px;
+        height: 28px;
+        border-radius: 6px;
+      }
+      h1 {
+        font-size: 15px;
+        font-weight: 600;
+        margin: 0;
+        letter-spacing: 0.2px;
+      }
+      .subtitle {
+        font-size: 11px;
+        color: #8d909a;
+        margin: 0 0 12px 0;
+      }
+      .section {
+        padding: 6px 0 10px 0;
+        border-top: 1px solid #262830;
+        margin-top: 6px;
+      }
+      .section:first-of-type {
+        border-top: none;
+        margin-top: 0;
+      }
+      .section-heading {
+        font-size: 13px;
+        font-weight: 600;
+        color: #eaeaea;
+        margin: 0 0 8px 0;
+        letter-spacing: 0.2px;
+      }
+      .action-btn {
+        flex: 1 1 auto;
+        min-width: 0;
+        padding: 7px 10px;
+        background: #262830;
+        color: #eaeaea;
+        border: 1px solid #3a3d46;
+        border-radius: 5px;
+        font-size: 12px;
+        font-family: inherit;
+        cursor: pointer;
+        transition: background 0.12s ease, border-color 0.12s ease;
+      }
+      .action-btn:hover:not(:disabled) {
+        background: #2f323b;
+        border-color: #4a4d56;
+      }
+      .action-btn:disabled {
+        opacity: 0.5;
+        cursor: default;
+      }
+      .action-btn.primary {
+        background: #ffd540;
+        color: #181a20;
+        border-color: #ffd540;
+        font-weight: 600;
+      }
+      .action-btn.primary:hover:not(:disabled) {
+        background: #ffe066;
+        border-color: #ffe066;
+      }
+      .configure-row {
+        display: flex;
+        flex-direction: column;
+        gap: 4px;
+        margin: 10px 0;
+      }
+      .configure-row label {
+        font-size: 12px;
+        color: #c2c5cd;
+        font-weight: 500;
+      }
+      .configure-input {
+        padding: 7px 10px;
+        background: #1d1f26;
+        color: #eaeaea;
+        border: 1px solid #3a3d46;
+        border-radius: 5px;
+        font-size: 12px;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        width: 100%;
+        box-sizing: border-box;
+      }
+      .configure-input:focus {
+        outline: none;
+        border-color: #ffd540;
+      }
+      .configure-folder-display {
+        font-size: 11px;
+        color: #8d909a;
+        font-family: ui-monospace, "SF Mono", Menlo, Consolas, monospace;
+        background: #1d1f26;
+        border: 1px solid #262830;
+        border-radius: 5px;
+        padding: 7px 10px;
+        word-break: break-all;
+        line-height: 1.4;
+      }
+      .configure-folder-display.empty {
+        color: #6e717a;
+        font-style: italic;
+        font-family: inherit;
+      }
+      .configure-preview {
+        font-size: 12px;
+        line-height: 1.4;
+        padding: 8px 10px;
+        border-radius: 5px;
+        margin: 8px 0 0 0;
+      }
+      .configure-preview[hidden] {
+        display: none;
+      }
+      .configure-preview.info {
+        background: #1d2a1d;
+        border: 1px solid #2f4f2f;
+        color: #b5d4b5;
+      }
+      .configure-preview.created {
+        background: #1d2530;
+        border: 1px solid #2f4360;
+        color: #b5c8e0;
+      }
+      .configure-preview.error {
+        background: #2a1d20;
+        border: 1px solid #5a3540;
+        color: #f5b3b3;
+      }
+      .configure-advisory {
+        font-size: 11px;
+        color: #8d909a;
+        margin: 6px 0 12px 0;
+        line-height: 1.4;
+      }
+      .configure-lock-tip {
+        font-size: 11px;
+        color: #ffd54f;
+        background: #2a2517;
+        border: 1px solid #5a4f2f;
+        border-radius: 5px;
+        padding: 7px 10px;
+        margin: 6px 0 12px 0;
+        line-height: 1.4;
+      }
+      .configure-lock-tip[hidden] {
+        display: none;
+      }
+      .configure-buttons {
+        display: flex;
+        gap: 6px;
+        margin-top: 12px;
+      }
+      .clear-config-link {
+        text-align: right;
+        margin-top: 8px;
+      }
+      .config-link {
+        display: inline-block;
+        background: none;
+        border: none;
+        padding: 4px 0 0 0;
+        font-family: inherit;
+        font-size: 11px;
+        color: #7a9eff;
+        cursor: pointer;
+        text-decoration: underline;
+        text-underline-offset: 2px;
+      }
+      .config-link:hover:not(:disabled) {
+        color: #9fb8ff;
+      }
+      .config-link:disabled {
+        color: #5a5e68;
+        cursor: default;
+        text-decoration: none;
+      }
+      .config-row {
+        display: flex;
+        align-items: center;
+        gap: 8px;
+        padding: 4px 0;
+        font-size: 12px;
+        cursor: pointer;
+      }
+      .config-row input[type="checkbox"] {
+        margin: 0;
+        accent-color: #ffd540;
+        flex-shrink: 0;
+      }
+      .config-row .config-label {
+        line-height: 1.3;
+      }
+      .tab-gone {
+        background: #2a1d20;
+        border: 1px solid #5a3540;
+        color: #f5b3b3;
+        border-radius: 5px;
+        padding: 10px 12px;
+        font-size: 12px;
+        line-height: 1.4;
+        margin: 8px 0;
+      }
+      .tab-gone[hidden] {
+        display: none;
+      }
+    </style>
+  </head>
+  <body>
+    <header>
+      <img src="../icons/icon-48.png" alt="" />
+      <h1>Configure live export</h1>
+    </header>
+    <p class="subtitle">Folder, filename, and what to include in the exported markdown.</p>
+
+    <div class="tab-gone" id="tabGoneBanner" hidden>The Voyage tab is no longer available. Reopen beta.voyage.io or alpha.voyage.io and try again.</div>
+
+    <div class="section">
+      <div class="section-heading">Export location</div>
+
+      <div class="configure-lock-tip" id="lockTip" hidden>Stop live export first to change folder or filename.</div>
+
+      <div class="configure-row">
+        <label for="pickFolderBtn">Export folder</label>
+        <button type="button" class="action-btn" id="pickFolderBtn">Pick export folder…</button>
+        <div class="configure-folder-display empty" id="pickedFolderDisplay">No folder picked yet</div>
+      </div>
+
+      <div class="configure-row">
+        <label for="configFilename">Filename</label>
+        <input type="text" class="configure-input" id="configFilename" placeholder="voyage-story.md" spellcheck="false" autocomplete="off" />
+      </div>
+
+      <div class="configure-advisory">Voyage Tools can read and write files in the picked folder. The file will be created if it doesn't exist; existing content is preserved.</div>
+
+      <div class="configure-preview" id="configResolvePreview" hidden></div>
+
+      <div class="configure-buttons">
+        <button type="button" class="action-btn" id="configCancelBtn">Cancel</button>
+        <button type="button" class="action-btn primary" id="configSaveBtn">Save</button>
+      </div>
+
+      <div class="clear-config-link">
+        <button type="button" class="config-link" id="clearConfigLink" hidden>Clear configuration</button>
+      </div>
+    </div>
+
+    <div class="section">
+      <div class="section-heading">Include in exports</div>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeInputs" />
+        <span class="config-label">Your typed actions &amp; dialogue</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeChecks" />
+        <span class="config-label">Skill check rolls and modifiers</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeStatus" />
+        <span class="config-label">Status updates (inventory, level-ups, resources)</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeNpcConversations" />
+        <span class="config-label">Full NPC conversations &amp; AI summary (live export only — can't be recovered after the turn rolls)</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeNpcChats" />
+        <span class="config-label">Compact NPC chat summaries (only used when full conversations is off)</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeCharacters" />
+        <span class="config-label">Characters in scene (per-turn cast list)</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeMusic" />
+        <span class="config-label">Music &amp; ambience cues</span>
+      </label>
+      <label class="config-row">
+        <input type="checkbox" id="storyIncludeMarkers" />
+        <span class="config-label" id="storyIncludeMarkersLabel">Live export resume markers (hidden comments needed to resume existing story documents.)</span>
+      </label>
+    </div>
+
+    <script src="configure.js"></script>
+  </body>
+</html>

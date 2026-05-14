@@ -5,6 +5,38 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.0] - 2026-05-13
+
+### Changed
+- **Configure flow moved to its own browser tab.** Clicking "Configure export options…" in the popup now opens a new browser tab (via `chrome.tabs.create`) right next to the Voyage tab. Tabs survive the OS folder picker's focus-steal without any close-on-blur behavior, and the user gets standard browser controls (back, pin, drag-reorder). The configure page's body is `max-width`-locked to 480px so the layout stays readable on wide displays. Single-instance: clicking Configure with the tab already open focuses it (and its window) instead of opening a duplicate.
+- **Export-option toggles relocated to the Configure window.** The eight "Include in exports" toggles (typed actions, skill checks, status updates, NPC conversations, NPC summaries, characters in scene, music cues, resume markers) now live in the Configure window's "Include in exports" section. The main popup keeps only the page-feature toggles (Performance fix, Skip All button).
+- Main popup is now status + actions only: status card, Current turn / Whole story export buttons, Start/Stop live export, file path display, and the Configure button. Tighter and quicker to scan.
+- The "Change folder/filename…" link is removed; the Configure button is the single entry point for all export configuration.
+
+### Fixed
+- The Configure UI is no longer killed by the OS folder picker stealing focus. Previously, picking a folder closed the popup and lost the picked-handle state; users had to reopen the popup and discover the configuration hadn't saved.
+
+### Added
+- Configure window auto-recovers a previously-picked folder if it was closed before Save (defensive — the chrome.windows.create flow makes this nearly impossible now).
+- Configure window detects when the Voyage tab is closed mid-flow and disables the form with a clear "tab is no longer available" banner.
+
+## [1.1.0] - 2026-05-13
+
+### Fixed
+- **The actual root cause of every "NPC chat got wiped on resume/start" report.** On Windows, `window.showSaveFilePicker` pre-truncates the picked file's contents before our code can read them — every prior data-loss incident traced back to this. Live export now uses `window.showDirectoryPicker` to pick a folder, then opens the file inside it via `directoryHandle.getFileHandle(filename, { create: true })`, which never truncates. The v1.0.3 → v1.0.5 preservation logic (markers, pre-sync cleanup, conservation checks) now actually runs against real file content.
+
+### Added
+- New Configure subpage in the popup. Pick the export folder once and choose a filename (defaults to the canonical `voyage-{slug}-{character}.md`). Save persists folder + filename per campaign roomId. A "Change folder / filename…" link is always visible (disabled while live export is active) so the configuration can be updated without losing it.
+- The Configure subpage shows whether the picked filename will **resume an existing export** (with the last turn number) or **create a new file**, before the user commits with Save.
+- "Clear configuration" link inside Configure forgets the saved folder/filename for the current campaign.
+- Filename validation in Configure: rejects path separators, NUL bytes, and Windows reserved names (`CON`, `PRN`, etc.); auto-appends `.md` if missing.
+- The folder + filename are shown in the main view whenever a configuration exists, not just while live export is active.
+
+### Changed
+- **Live export is now configure-then-start.** The single Start/Resume/Stop button cycles based on configuration state: `Configure live export` (no config) → `Start live export` (has config, paused) → `Stop live export` (running). There's no longer any distinction between Start and Resume — Start always re-opens the configured file non-destructively.
+- **Stop preserves the configuration.** Previously, Stop cleared the IDB record so the next launch required re-picking the file. Now Stop only pauses writing; the folder + filename persist until you explicitly Clear them.
+- IDB record shape changed from `{ handle, lastWrittenTick }` (file handle) to `{ directoryHandle, filename, lastWrittenTick }`. **One-time reconfigure required for existing users** — old records are detected and cleaned up on load, and the popup falls through to "Configure live export" so users re-pick a folder once.
+
 ## [1.0.5] - 2026-05-13
 
 ### Added
