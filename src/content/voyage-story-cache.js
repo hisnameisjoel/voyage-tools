@@ -257,6 +257,28 @@
         // don't need for export.
         harvestTurns(payload.turnData);
         break;
+      case 'sendUndoState': {
+        // The most recently committed turn has been rolled back. Find the
+        // highest tick in the cache (that's the one just undone), remove it,
+        // and clear any NPC chats attributed to it. The live narration
+        // (if any) is gone too.
+        let undoneTick = null;
+        for (const tick of cache.turns.keys()) {
+          if (undoneTick === null || tick > undoneTick) undoneTick = tick;
+        }
+        if (undoneTick !== null) {
+          cache.turns.delete(undoneTick);
+          for (const [key, chat] of cache.npcChats) {
+            if (chat.turnTick === undoneTick) {
+              cache.npcChats.delete(key);
+              if (cache.currentChatKey === key) cache.currentChatKey = null;
+            }
+          }
+          changeExtra = { undoneTick };
+        }
+        cache.liveTurn = null;
+        break;
+      }
       case 'storyRewritten': {
         // Narrator-driven rewrite of a completed turn's story body. Payload:
         //   { turnTick: number, newStoryMessage: string }

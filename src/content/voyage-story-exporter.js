@@ -1580,6 +1580,55 @@
     liveExport.debounceTimer = setTimeout(() => enqueueWrite(appendNewTurns), 500);
   }
 
+  // Called when sendUndoState arrives. Removes the undone turn (and any NPC
+  // chat blocks attributed to it) from the live export file by truncating
+  // from their start to EOF, then updates lastWrittenTick.
+  // If the turn was never written (e.g. undo before narration completed),
+  // the marker won't be in the file and we return early — no write needed.
+  async function truncateFromTick(tick) {
+    if (!liveExport) return;
+    try {
+      const file = await liveExport.handle.getFile();
+      const content = await file.text();
+      const markerStr = `<!-- voyage-turn:tick=${tick} -->`;
+      const markerIdx = content.indexOf(markerStr);
+      if (markerIdx === -1) return;
+
+      // Locate the ## Turn heading above the marker (same logic as rewriteTurnInFile).
+      const beforeMarker = content.slice(0, markerIdx);
+      const headingNewlineIdx = beforeMarker.lastIndexOf('\n## ');
+      const headingStart = headingNewlineIdx === -1 ? 0 : headingNewlineIdx + 1;
+
+      // NPC chat blocks for this tick are placed immediately before the ##
+      // heading. If any exist, extend the cut point to include them.
+      const beforeHeading = content.slice(0, headingStart);
+      const npcStartTag = `voyage-npc-chat:start:tick=${tick}:`;
+      const npcIdx = beforeHeading.indexOf(npcStartTag);
+      const cutIdx = npcIdx !== -1
+        ? beforeHeading.lastIndexOf('<!--', npcIdx)
+        : headingStart;
+
+      const trimmed = content.slice(0, cutIdx).trimEnd();
+      await writeToHandle(liveExport.handle, trimmed ? trimmed + '\n' : '', `truncateFromTick(${tick})`);
+
+      const snap = await callMain('getSnapshot');
+      const newLast = (snap.turns || []).reduce((m, t) => Math.max(m, t.tick), -Infinity);
+      liveExport.lastWrittenTick = isFinite(newLast) ? newLast : null;
+
+      // Remove chat state entries for the undone tick so they re-render if restored.
+      for (const key of [...liveExport.writtenChatState.keys()]) {
+        if (key.endsWith(`::${tick}`)) liveExport.writtenChatState.delete(key);
+      }
+
+      await persistLiveExport();
+      setStatus(`Undo: removed turn ${tick} from live export.`, 3000);
+      dbg('truncateFromTick', { tick, cutIdx, newLast: liveExport.lastWrittenTick });
+    } catch (e) {
+      console.error('[voyage-story] truncateFromTick:', e);
+      setStatus(`Live export undo error: ${e.message}`, 5000);
+    }
+  }
+
   // NPC chats are written incrementally to the file as messages stream in —
   // each event (open, send, response, close) triggers a debounced flush
   // that appends only the delta since the last write. The 500ms debounce
@@ -1901,6 +1950,8 @@
     if (!liveExport) return;
     if (event === 'joinedRoom') {
       maybeAutoStopOnCampaignSwitch();
+    } else if (event === 'sendUndoState' && typeof extra?.undoneTick === 'number') {
+      enqueueWrite(() => truncateFromTick(extra.undoneTick));
     } else if (event === 'storyRewritten' && typeof extra?.turnTick === 'number') {
       scheduleRewrite(extra.turnTick);
     } else if (
