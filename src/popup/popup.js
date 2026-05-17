@@ -1,38 +1,63 @@
 /*
  * Voyage Tools — Popup script
  *
- * The popup is a thin status + actions surface. The folder picker, filename
- * input, and export-option toggles live in a separate configure page
- * (configure.html / configure.js) opened in a new browser tab via
- * chrome.tabs.create. Tabs survive the OS folder picker's focus-steal, which
- * would otherwise close this popup mid-flow.
+ * The popup is the single UI surface for story export. All configure options
+ * (folder pick, filename, include toggles) live inline in configureSection,
+ * toggled by configureToggleBtn — no separate browser tab needed.
  *
- * Page-feature toggles (perfFix, skipButton) stay here because they're
+ * Folder picking uses chrome.scripting.executeScript to inject
+ * showDirectoryPicker() into the Voyage tab's MAIN world (beta.voyage.io
+ * origin). The handle is relayed to the isolated world via window.postMessage
+ * (same-origin, so prototype methods survive). This sidesteps Chrome's
+ * FileSystemHandle origin-locking, which destroys handles passed through
+ * chrome.tabs.sendMessage even with structured_clone.
+ *
+ * Page-feature toggles (perfFix, skipButton) stay separate because they're
  * always-on convenience flips, not part of the export pipeline.
- *
- * Communication with the Voyage tab's content script is via
- * chrome.tabs.sendMessage with { source: 'voyage-story', action }.
  */
 
-// ---------- Settings persistence (page-feature toggles only) ----------
+// ---------- Settings persistence ----------
 const MAIN_TOGGLES = ['perfFix', 'skipButton'];
+const STORY_CONFIG = [
+  'storyIncludeInputs',
+  'storyIncludeChecks',
+  'storyIncludeStatus',
+  'storyIncludeNpcChats',
+  'storyIncludeNpcConversations',
+  'storyIncludeCharacters',
+  'storyIncludeMusic',
+  'storyIncludeMarkers',
+];
+const STORY_CONFIG_DEFAULTS_OFF = new Set(['storyIncludeNpcChats', 'storyIncludeMusic']);
 const NAMESPACE = 'voyage-story';
 
-function defaultFor(_key) {
-  // Both main toggles default on.
+function defaultFor(key) {
+  if (STORY_CONFIG_DEFAULTS_OFF.has(key)) return false;
   return true;
 }
 
-function setStorySectionVisible(visible) {
-  const section = document.getElementById('storySection');
-  if (section) section.hidden = !visible;
+function bindToggles(keys) {
+  chrome.storage.local.get(keys, (result) => {
+    for (const key of keys) {
+      const el = document.getElementById(key);
+      if (!el) continue;
+      const stored = result[key];
+      el.checked = typeof stored === 'boolean' ? stored : defaultFor(key);
+    }
+  });
+  for (const key of keys) {
+    const el = document.getElementById(key);
+    if (!el) continue;
+    el.addEventListener('change', (e) => {
+      chrome.storage.local.set({ [key]: e.target.checked });
+    });
+  }
 }
 
 // ---------- Active Voyage tab discovery ----------
 async function getActiveVoyageTab() {
   const tabs = await chrome.tabs.query({ active: true, currentWindow: true });
   const tab = tabs[0];
-  // Match both subdomains registered in the manifest.
   if (!tab || !tab.url || !/^https:\/\/(beta|alpha)\.voyage\.io\//.test(tab.url)) return null;
   return tab;
 }
@@ -42,92 +67,44 @@ async function sendToContentScript(tabId, action, extra = {}) {
   return await chrome.tabs.sendMessage(tabId, { source: NAMESPACE, action, ...extra });
 }
 
-// ---------- Configure-tab tracking ----------
-// Configure runs in a regular browser tab (opened via chrome.tabs.create)
-// rather than a chrome.windows.create popup window. Both survive the OS
-// folder picker's blur, but a tab gives the user normal browser controls
-// (back/forward, pin, drag-reorder) and avoids any "did the window
-// disappear?" confusion when the picker lands on top of a small popup
-// window. The configure.html body is `max-width`-locked so the tab
-// content stays visually constrained even on wide displays.
-//
-// Single-instance: subsequent clicks focus the existing tab (and the
-// window it lives in) instead of opening a duplicate. The id is cleared
-// when the user closes the tab via chrome.tabs.onRemoved.
-let configureTabId = null;
-chrome.tabs.onRemoved.addListener((tabId) => {
-  if (tabId === configureTabId) configureTabId = null;
-});
-
-async function openConfigureWindow() {
-  if (currentTabId == null) return;
-  // Permission must be requested under the popup's user-gesture context. If
-  // we wait for the configure tab to ask, the gesture is lost.
-  const granted = await ensureScriptingPermission();
-  if (!granted) {
-    setStatusText('Live export needs the "scripting" permission. Click Configure again to be prompted, or grant it in chrome://extensions.');
-    return;
-  }
-  if (configureTabId != null) {
-    try {
-      const tab = await chrome.tabs.get(configureTabId);
-      await chrome.tabs.update(configureTabId, { active: true });
-      // The tab may live in a different browser window than the popup —
-      // focus that window too so the user actually sees the tab.
-      if (tab?.windowId != null) {
-        try { await chrome.windows.update(tab.windowId, { focused: true }); } catch {}
-      }
-      return;
-    } catch {
-      // Stored id is stale (tab closed without onRemoved firing before we
-      // got here, e.g. browser shutdown sequence). Fall through to create.
-      configureTabId = null;
-    }
-  }
-  const url = chrome.runtime.getURL(`src/popup/configure.html#tabId=${currentTabId}`);
-  try {
-    const tab = await chrome.tabs.create({
-      url,
-      active: true,
-      // openerTabId places the new tab immediately to the right of the
-      // Voyage tab in the tab strip, the same way a regular link click
-      // would. Both tabs live in the same window since `currentTabId`
-      // came from `chrome.tabs.query({ currentWindow: true })`.
-      openerTabId: currentTabId,
-    });
-    configureTabId = tab?.id ?? null;
-  } catch (e) {
-    console.error('[voyage popup] openConfigureWindow', e);
-    setStatusText(`Couldn't open the configure tab: ${e?.message || 'unknown error'}.`);
-  }
-}
-
-async function ensureScriptingPermission() {
-  try {
-    return await chrome.permissions.request({ permissions: ['scripting'] });
-  } catch (e) {
-    console.error('[voyage popup] permission request failed', e);
-    return false;
-  }
-}
-
-// ---------- Story export UI ----------
+// ---------- Story export UI element refs ----------
 const els = {
-  status:        null,
-  exportRow:     null,
-  tip:           null,
-  filepath:      null,
-  filename:      null,
-  currentBtn:    null,
-  wholeBtn:      null,
-  liveBtn:       null,
-  configureBtn:  null,
+  // Main view
+  status:           null,
+  exportRow:        null,
+  tip:              null,
+  filepath:         null,
+  filename:         null,
+  currentBtn:       null,
+  wholeBtn:         null,
+  liveBtn:          null,
+  configureToggle:  null,
+  // Configure section
+  configureSection: null,
+  lockTip:          null,
+  pickFolderBtn:    null,
+  pickedFolder:     null,
+  configFilename:   null,
+  configPreview:    null,
+  configSaveBtn:    null,
+  configCancelBtn:  null,
+  clearConfig:      null,
+  markersInput:     null,
+  markersLabel:     null,
 };
 
 let pollingTimer = null;
 let currentTabId = null;
 let currentStatus = null;
 
+// Configure section state
+let configDraft = {
+  folderName: null,
+  hasFolder: false,
+};
+let savingInFlight = false;
+
+// ---------- Status text helpers ----------
 function setStatusText(html) {
   if (!els.status) return;
   while (els.status.firstChild) els.status.removeChild(els.status.firstChild);
@@ -159,22 +136,233 @@ function makeLiveActiveLine(status) {
   dot.textContent = '●';
   line.appendChild(dot);
 
-  let suffix = '';
-  if (status.currentChatNpcName) {
-    suffix = ` · recording chat with ${status.currentChatNpcName}`;
-  } else if (status.hasLiveTurn) {
-    suffix = ' · recording new turn';
+  if (status.syncPhase) {
+    line.appendChild(document.createTextNode(` Live export — ${status.syncPhase}`));
+  } else {
+    let suffix = '';
+    if (status.currentChatNpcName) {
+      suffix = ` · recording chat with ${status.currentChatNpcName}`;
+    } else if (status.hasLiveTurn) {
+      suffix = ' · recording new turn';
+    }
+    line.appendChild(document.createTextNode(` Live export active${suffix}`));
   }
-  line.appendChild(document.createTextNode(` Live export active${suffix}`));
   return line;
 }
 
+function setStorySectionVisible(visible) {
+  const section = document.getElementById('storySection');
+  if (section) section.hidden = !visible;
+}
+
+// ---------- Configure section helpers ----------
+function showConfigPreview(klass, text) {
+  if (!els.configPreview) return;
+  els.configPreview.hidden = false;
+  els.configPreview.textContent = text;
+  els.configPreview.className = `configure-preview ${klass}`;
+}
+
+function clearConfigPreview() {
+  if (!els.configPreview) return;
+  els.configPreview.hidden = true;
+  els.configPreview.textContent = '';
+}
+
+function isLiveActive() {
+  return !!currentStatus?.liveExport?.active;
+}
+
+function setConfigSaveButtonState() {
+  if (!els.configSaveBtn) return;
+  const filenameNonEmpty = !!(els.configFilename?.value || '').trim();
+  els.configSaveBtn.disabled =
+    !(configDraft.hasFolder && filenameNonEmpty) ||
+    isLiveActive() ||
+    savingInFlight ||
+    currentTabId == null;
+}
+
+function setConfigureVisible(visible) {
+  if (els.configureSection) els.configureSection.hidden = !visible;
+}
+
+// ---------- Action handlers: configure section ----------
+async function onPickFolderClick() {
+  if (currentTabId == null || isLiveActive()) return;
+  clearConfigPreview();
+  // Inject showDirectoryPicker() into the Voyage tab's MAIN world. The popup
+  // overlays the active tab so the user gesture propagates. The handle stays
+  // in the beta.voyage.io realm and is relayed to the isolated world via
+  // window.postMessage (same-origin, preserving prototype methods).
+  let results;
+  try {
+    results = await chrome.scripting.executeScript({
+      target: { tabId: currentTabId },
+      world: 'MAIN',
+      func: async () => {
+        try {
+          const h = await window.showDirectoryPicker({ mode: 'readwrite' });
+          window.postMessage(
+            { source: 'voyage-story', type: 'pushPendingDir', directoryHandle: h, dirName: h.name },
+            location.origin,
+          );
+          return { ok: true, dirName: h.name };
+        } catch (e) {
+          if (e?.name === 'AbortError') return { ok: false, aborted: true };
+          return { ok: false, message: e?.message || e?.name || 'unknown' };
+        }
+      },
+    });
+  } catch (e) {
+    showConfigPreview('error', `Folder picker failed: ${e?.message || 'unknown error'}.`);
+    return;
+  }
+
+  const result = results?.[0]?.result;
+  console.log('[voyage popup] executeScript result:', result);
+  if (!result || result.aborted) return;
+  if (!result.ok) {
+    showConfigPreview('error', `Folder picker error: ${result.message || 'unknown'}.`);
+    return;
+  }
+
+  configDraft.folderName = result.dirName;
+  configDraft.hasFolder = true;
+  if (els.pickedFolder) {
+    els.pickedFolder.textContent = result.dirName;
+    els.pickedFolder.classList.remove('empty');
+  }
+  showConfigPreview('info', 'Folder picked. Confirm the filename and click Save.');
+  setConfigSaveButtonState();
+}
+
+async function onConfigSave() {
+  if (currentTabId == null || isLiveActive() || savingInFlight) return;
+  if (!configDraft.hasFolder) {
+    showConfigPreview('error', 'Pick a folder first.');
+    return;
+  }
+  const filename = (els.configFilename?.value || '').trim();
+  if (!filename) {
+    showConfigPreview('error', 'Filename is empty.');
+    return;
+  }
+  savingInFlight = true;
+  setConfigSaveButtonState();
+
+  let result;
+  try {
+    // handle is passed as null — the content script reads pendingDirHandle
+    // (set by the MAIN-world postMessage relay) instead.
+    result = await sendToContentScript(currentTabId, 'configureLiveExport', { handle: null, filename });
+  } catch (e) {
+    savingInFlight = false;
+    showConfigPreview('error', `Save failed: ${e?.message || 'tab gone'}.`);
+    setConfigSaveButtonState();
+    return;
+  }
+
+  savingInFlight = false;
+  setConfigSaveButtonState();
+
+  if (!result) {
+    showConfigPreview('error', 'Save returned no result.');
+    return;
+  }
+  if (!result.ok) {
+    showConfigPreview('error', result.message || 'Save failed.');
+    return;
+  }
+
+  setConfigureVisible(false);
+  await refreshStatus();
+}
+
+function onConfigCancel() {
+  clearConfigPreview();
+  setConfigureVisible(false);
+}
+
+async function onClearConfig() {
+  if (currentTabId == null) return;
+  if (!confirm('Clear the saved folder and filename for this campaign?')) return;
+  let result;
+  try {
+    result = await sendToContentScript(currentTabId, 'clearConfig');
+  } catch (e) {
+    showConfigPreview('error', `Couldn't clear configuration: ${e?.message || 'reload the Voyage tab.'}`);
+    return;
+  }
+  if (result && !result.ok) {
+    showConfigPreview('error', result.message || 'Clear failed.');
+    return;
+  }
+  configDraft.hasFolder = false;
+  configDraft.folderName = null;
+  if (els.pickedFolder) {
+    els.pickedFolder.textContent = 'No folder picked yet';
+    els.pickedFolder.classList.add('empty');
+  }
+  setConfigureVisible(false);
+  await refreshStatus();
+}
+
+function openConfigureSection() {
+  if (currentTabId == null) return;
+  clearConfigPreview();
+
+  // Pre-fill from current status
+  if (els.configFilename) {
+    els.configFilename.value =
+      currentStatus?.configFilename ||
+      currentStatus?.suggestedFilename ||
+      'voyage-story.md';
+  }
+
+  // Pre-fill folder display: prefer saved config, then any pending pick
+  const folderName = currentStatus?.configFolderName || currentStatus?.pendingDirName || null;
+  if (folderName) {
+    configDraft.folderName = folderName;
+    configDraft.hasFolder = true;
+    if (els.pickedFolder) {
+      els.pickedFolder.textContent = folderName;
+      els.pickedFolder.classList.remove('empty');
+    }
+  } else {
+    configDraft.folderName = null;
+    configDraft.hasFolder = false;
+    if (els.pickedFolder) {
+      els.pickedFolder.textContent = 'No folder picked yet';
+      els.pickedFolder.classList.add('empty');
+    }
+  }
+
+  applyConfigureLockState();
+  setConfigSaveButtonState();
+  setConfigureVisible(true);
+}
+
+function applyConfigureLockState() {
+  const liveActive = isLiveActive();
+  if (els.lockTip) els.lockTip.hidden = !liveActive;
+  if (els.pickFolderBtn) els.pickFolderBtn.disabled = liveActive;
+  if (els.markersInput) els.markersInput.disabled = liveActive;
+  if (els.markersLabel) {
+    els.markersLabel.textContent = liveActive
+      ? 'Live export resume markers (required while live export is active)'
+      : 'Live export resume markers (hidden comments needed to resume existing story documents.)';
+  }
+  if (els.clearConfig) els.clearConfig.hidden = !currentStatus?.hasConfig;
+}
+
+// ---------- Main action handlers ----------
 function hideActions() {
-  if (els.exportRow)    els.exportRow.hidden = true;
-  if (els.liveBtn)      els.liveBtn.hidden = true;
-  if (els.tip)          els.tip.hidden = true;
-  if (els.filepath)     els.filepath.hidden = true;
-  if (els.configureBtn) els.configureBtn.hidden = true;
+  if (els.exportRow)       els.exportRow.hidden = true;
+  if (els.liveBtn)         els.liveBtn.hidden = true;
+  if (els.tip)             els.tip.hidden = true;
+  if (els.filepath)        els.filepath.hidden = true;
+  if (els.configureToggle) els.configureToggle.hidden = true;
 }
 
 function renderStatus(status) {
@@ -210,7 +398,7 @@ function renderStatus(status) {
   lines.push(makeLine(title, 'session-name'));
 
   const metaParts = [];
-  if (status.syncPhase) {
+  if (status.syncPhase && !status.liveExport?.active) {
     metaParts.push(status.syncPhase);
   } else if (status.loadingHistory) {
     metaParts.push('loading history…');
@@ -240,12 +428,6 @@ function renderStatus(status) {
   }
   if (els.wholeBtn) els.wholeBtn.disabled = false;
 
-  // Primary button:
-  //   active    → "Stop live export"          (soft red)
-  //   hasConfig → "Start live export"         (yellow primary)
-  //   none      → hidden (user clicks Configure first; the Configure button
-  //               below is the only way forward without a config)
-  //   no-FSA    → disabled "Live export not supported here"
   if (els.liveBtn) {
     if (liveActive) {
       els.liveBtn.hidden = false;
@@ -268,11 +450,10 @@ function renderStatus(status) {
     }
   }
 
-  // File path display.
   if (els.filepath && els.filename) {
     let displayFolder = null;
     let displayFilename = null;
-    if (status.liveExport?.active) {
+    if (liveActive) {
       displayFolder   = status.liveExport.folderName || status.configFolderName || null;
       displayFilename = status.liveExport.filename   || status.configFilename   || null;
     } else if (hasConfig) {
@@ -288,15 +469,10 @@ function renderStatus(status) {
     }
   }
 
-  // Configure button is always visible (and enabled) as long as the
-  // directory picker is supported. It opens the separate configure window
-  // for everything: folder, filename, toggles. While live export is active
-  // the configure window itself locks the folder/filename section — the
-  // button stays clickable so the user can still adjust toggles.
-  if (els.configureBtn) {
-    els.configureBtn.hidden = false;
-    els.configureBtn.disabled = !status.directoryPickerSupported;
-    els.configureBtn.textContent = hasConfig
+  if (els.configureToggle) {
+    els.configureToggle.hidden = !status.directoryPickerSupported;
+    els.configureToggle.disabled = false;
+    els.configureToggle.textContent = hasConfig
       ? 'Configure export options…'
       : 'Configure live export…';
   }
@@ -306,8 +482,6 @@ function renderStatus(status) {
       els.tip.textContent = 'Turns auto-append while the Voyage tab is open.';
       els.tip.hidden = false;
     } else if (!status.directoryPickerSupported) {
-      // Configure button is disabled in this state — point users at the
-      // real problem instead of telling them to click a dead control.
       els.tip.textContent = 'Live export requires a Chromium-based browser with the File System Access API.';
       els.tip.hidden = false;
     } else if (hasConfig) {
@@ -316,6 +490,23 @@ function renderStatus(status) {
     } else {
       els.tip.textContent = 'Click Configure to pick a folder and filename, then come back to Start.';
       els.tip.hidden = false;
+    }
+  }
+
+  // If configure section is open, keep lock state in sync with live export status.
+  if (els.configureSection && !els.configureSection.hidden) {
+    applyConfigureLockState();
+    setConfigSaveButtonState();
+    // If a pending pick landed (postMessage relay), update folder display.
+    if (status.pendingDirName && status.pendingDirName !== configDraft.folderName) {
+      configDraft.folderName = status.pendingDirName;
+      configDraft.hasFolder = true;
+      if (els.pickedFolder) {
+        els.pickedFolder.textContent = status.pendingDirName;
+        els.pickedFolder.classList.remove('empty');
+      }
+      showConfigPreview('info', 'Folder picked. Confirm the filename and click Save.');
+      setConfigSaveButtonState();
     }
   }
 }
@@ -347,7 +538,7 @@ function stopPolling() {
   }
 }
 
-// ---------- Action handlers ----------
+// ---------- Main action handlers ----------
 async function onExportCurrentTurn() {
   if (currentTabId == null) return;
   els.currentBtn.disabled = true;
@@ -401,50 +592,45 @@ async function onLiveExportClick() {
     await refreshStatus();
     return;
   }
-  // No config + live not active → open Configure. This branch is rare since
-  // the Configure button is the primary entry point in that state, but it's
-  // here as a fallback if the user clicks an outdated liveExportBtn before
-  // status refreshes.
-  await openConfigureWindow();
+  openConfigureSection();
 }
 
 // ---------- Init ----------
-function bindToggles() {
-  chrome.storage.local.get(MAIN_TOGGLES, (result) => {
-    for (const key of MAIN_TOGGLES) {
-      const el = document.getElementById(key);
-      if (!el) continue;
-      const stored = result[key];
-      el.checked = typeof stored === 'boolean' ? stored : defaultFor(key);
-    }
-  });
-
-  for (const key of MAIN_TOGGLES) {
-    const el = document.getElementById(key);
-    if (!el) continue;
-    el.addEventListener('change', (e) => {
-      chrome.storage.local.set({ [key]: e.target.checked });
-    });
-  }
-}
-
 async function init() {
-  els.status        = document.getElementById('storyStatus');
-  els.exportRow     = document.getElementById('storyExportRow');
-  els.tip           = document.getElementById('storyTip');
-  els.filepath      = document.getElementById('storyFilepath');
-  els.filename      = document.getElementById('storyFilename');
-  els.currentBtn    = document.getElementById('exportCurrentTurnBtn');
-  els.wholeBtn      = document.getElementById('exportWholeStoryBtn');
-  els.liveBtn       = document.getElementById('liveExportBtn');
-  els.configureBtn  = document.getElementById('configureExportBtn');
+  els.status          = document.getElementById('storyStatus');
+  els.exportRow       = document.getElementById('storyExportRow');
+  els.tip             = document.getElementById('storyTip');
+  els.filepath        = document.getElementById('storyFilepath');
+  els.filename        = document.getElementById('storyFilename');
+  els.currentBtn      = document.getElementById('exportCurrentTurnBtn');
+  els.wholeBtn        = document.getElementById('exportWholeStoryBtn');
+  els.liveBtn         = document.getElementById('liveExportBtn');
+  els.configureToggle = document.getElementById('configureToggleBtn');
+  // Configure section
+  els.configureSection = document.getElementById('configureSection');
+  els.lockTip          = document.getElementById('lockTip');
+  els.pickFolderBtn    = document.getElementById('pickFolderBtn');
+  els.pickedFolder     = document.getElementById('pickedFolderDisplay');
+  els.configFilename   = document.getElementById('configFilename');
+  els.configPreview    = document.getElementById('configResolvePreview');
+  els.configSaveBtn    = document.getElementById('configSaveBtn');
+  els.configCancelBtn  = document.getElementById('configCancelBtn');
+  els.clearConfig      = document.getElementById('clearConfigLink');
+  els.markersInput     = document.getElementById('storyIncludeMarkers');
+  els.markersLabel     = document.getElementById('storyIncludeMarkersLabel');
 
-  bindToggles();
+  bindToggles([...MAIN_TOGGLES, ...STORY_CONFIG]);
 
   els.currentBtn?.addEventListener('click', onExportCurrentTurn);
   els.wholeBtn?.addEventListener('click', onExportWholeStory);
   els.liveBtn?.addEventListener('click', onLiveExportClick);
-  els.configureBtn?.addEventListener('click', openConfigureWindow);
+  els.configureToggle?.addEventListener('click', openConfigureSection);
+
+  els.pickFolderBtn?.addEventListener('click', onPickFolderClick);
+  els.configSaveBtn?.addEventListener('click', onConfigSave);
+  els.configCancelBtn?.addEventListener('click', onConfigCancel);
+  els.clearConfig?.addEventListener('click', onClearConfig);
+  els.configFilename?.addEventListener('input', setConfigSaveButtonState);
 
   const tab = await getActiveVoyageTab();
   currentTabId = tab?.id ?? null;

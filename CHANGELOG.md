@@ -5,6 +5,11 @@ All notable changes to this project will be documented in this file.
 The format follows [Keep a Changelog](https://keepachangelog.com/en/1.1.0/),
 and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.2.1] - 2026-05-16
+
+### Fixed
+- **Live export resume no longer falsely rejects same-campaign files.** Voyage assigns a new `roomId` each time it joins a room for the same save, so the session marker the exporter wrote on a previous session (`<!-- voyage-session:roomId=... -->`) wouldn't match the current room and Start live export would refuse to append with "That folder already has X but it belongs to a different campaign." The exporter now also writes a `<!-- voyage-session:saveId=... -->` marker, which is stable per save, and prefers `saveId` for the match. Files written before this fix (only `roomId`) are accepted as legacy on first resume, and their header is migrated to include `saveId` going forward.
+
 ## [1.2.0] - 2026-05-13
 
 ### Changed

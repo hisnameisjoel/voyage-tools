@@ -110,6 +110,10 @@ The release zip is intentionally minimal — no `.github/`, `.claude/`, `CHANGEL
 
 Watch progress at: `https://github.com/hisnameisjoel/voyage-tools/actions`
 
+## Logging policy
+
+**Never remove diagnostic logging without explicit user instruction.** When debugging, leave all `console.log` / `console.warn` / `console.error` statements in place until the user says to remove them. Past sessions have removed logging prematurely after thinking a fix was complete — this destroyed the ability to diagnose regressions. If you think logging is no longer needed, say so and ask; do not remove it unilaterally.
+
 ## Key technical notes
 
 * **WebSocket patching** — `voyage-story-cache.js` patches `window.WebSocket` at `document_start` in the MAIN world. It must run before the page constructs its socket or it misses the `/heroes/` connection. The `/tts/` socket is intentionally ignored.

@@ -10,12 +10,13 @@
  *                         exists, so the popup can render its controls
  *   exportCurrentTurn   — one-shot blob download of the live in-progress turn
  *   exportWholeStory    — pulls full history, formats markdown, blob download
- *   configureLiveExport — receives a FileSystemDirectoryHandle + filename
- *                         from the popup (via injected helper, since handles
- *                         can't cross chrome.tabs.sendMessage). Validates,
- *                         resolves the file inside the folder non-
- *                         destructively, persists to IDB. Does NOT start
- *                         writing — that's a separate Start click.
+ *   configureLiveExport — receives a filename from the popup. The
+ *                         FileSystemDirectoryHandle is taken from
+ *                         pendingDirHandle (posted by the MAIN world after
+ *                         the popup triggers showDirectoryPicker via
+ *                         executeScript) or falls back to the IDB record.
+ *                         Validates, resolves the file non-destructively,
+ *                         persists to IDB. Does NOT start writing.
  *   startLiveExport     — loads the saved directory handle + filename, opens
  *                         the file inside the folder via
  *                         `directoryHandle.getFileHandle(filename,
@@ -104,6 +105,10 @@
     writeQueue = writeQueue.then(fn).catch(() => {});
   }
   let storedHandleRoomId = null;    // roomId for which we have a saved handle but aren't actively writing
+  // FileSystemDirectoryHandle posted by the MAIN world (via window.postMessage)
+  // after the popup triggers showDirectoryPicker via executeScript. Consumed
+  // (and cleared) by configureLiveExport, then persisted to IDB.
+  let pendingDirHandle = null;
 
   // ---------- Verbose debug logging ----------
   // Off by default. Toggle by setting `voyageStoryDebug: true` in
@@ -426,6 +431,12 @@
     if (config.storyIncludeMarkers && snap.roomId) {
       out.push(`<!-- voyage-session:roomId=${snap.roomId} -->`);
     }
+    // saveId is the stable per-save identifier — roomId rotates each time
+    // Voyage assigns a new room to the same save, so resumes need saveId to
+    // recognize that an existing file belongs to the current campaign.
+    if (config.storyIncludeMarkers && snap.session?.saveId) {
+      out.push(`<!-- voyage-session:saveId=${snap.session.saveId} -->`);
+    }
     if (snap.world?.worldTitle) {
       out.push(`# ${snap.world.worldTitle}`);
       out.push('');
@@ -460,7 +471,7 @@
       }
       pushTurn(out, t, config);
     }
-    if (includeLive && snap.liveTurn) pushLiveTurn(out, snap.liveTurn);
+    if (includeLive && snap.liveTurn) pushLiveTurn(out, snap.liveTurn, config);
     return out.join('\n');
   }
 
@@ -756,11 +767,14 @@
     }
   }
 
-  function pushLiveTurn(out, live) {
+  function pushLiveTurn(out, live, config = {}) {
     const statusTag = live.status && live.status !== 'idle'
       ? ' *(live — in progress)*'
       : ' *(live)*';
     out.push(`## Turn ${live.turnNumber}${statusTag}`);
+    if (config.storyIncludeMarkers && typeof live.turnNumber === 'number') {
+      out.push(`<!-- voyage-turn:tick=${live.turnNumber} -->`);
+    }
     out.push('');
     if (!Array.isArray(live.chunks) || live.chunks.length === 0) {
       out.push('*Waiting for content…*');
@@ -876,7 +890,7 @@
     // to grab the last completed beat.
     if (snap.liveTurn) {
       const out = [];
-      pushLiveTurn(out, snap.liveTurn);
+      pushLiveTurn(out, snap.liveTurn, currentConfig);
       const filename = defaultFilename(snap.session, `turn${snap.liveTurn.turnNumber}`);
       triggerDownload(filename, out.join('\n'));
       setStatus(`Current turn downloaded (${filename}).`);
@@ -890,6 +904,10 @@
       return { ok: false, message: 'No turns loaded' };
     }
     const out = [];
+    const playerName = snap.character?.characterChoices?.name || 'Player';
+    for (const chat of (groupChatsByTurnTick(snap.npcChats).get(latest.tick) || [])) {
+      pushChat(out, chat, playerName, currentConfig);
+    }
     pushTurn(out, latest, currentConfig);
     const filename = defaultFilename(snap.session, `turn${latest.tick}`);
     triggerDownload(filename, out.join('\n'));
@@ -915,8 +933,12 @@
   // how we know where to pick up when the user picks an existing markdown
   // file (e.g. they played on their phone, came back to desktop, and want to
   // resume live export into the same file).
-  const TURN_MARKER_RE    = /<!--\s*voyage-turn:tick=(\d+)\s*-->/g;
-  const SESSION_MARKER_RE = /<!--\s*voyage-session:roomId=([\w-]+)\s*-->/;
+  const TURN_MARKER_RE          = /<!--\s*voyage-turn:tick=(\d+)\s*-->/g;
+  const SESSION_ROOM_MARKER_RE  = /<!--\s*voyage-session:roomId=([\w-]+)\s*-->/;
+  const SESSION_SAVE_MARKER_RE  = /<!--\s*voyage-session:saveId=([\w-]+)\s*-->/;
+  // Combined matcher for stripping legacy session markers when migrating a
+  // file forward. Global flag so replace() reaches every occurrence.
+  const SESSION_MARKER_LINE_RE  = /^<!--\s*voyage-session:(?:roomId|saveId)=[\w-]+\s*-->\r?\n?/gm;
   // Fallback for files written before markers existed (or files where the
   // user stripped the comments): scrape the heading tick directly.
   const TURN_HEADING_RE   = /^##\s+Turn\s+(\d+)/gm;
@@ -938,9 +960,14 @@
     return sawAny ? { tick: maxTick, source: 'heading' } : { tick: null, source: null };
   }
 
-  function parseSessionRoomId(text) {
-    const m = text.match(SESSION_MARKER_RE);
-    return m ? m[1] : null;
+  // Returns { roomId, saveId } parsed from the file header. Either field may
+  // be null. Pre-v1.2.1 files only carry the roomId marker; v1.2.1+ also
+  // include saveId, which is what we prefer for cross-session resume since
+  // Voyage rotates roomId per joinedRoom even within the same save.
+  function parseSessionMarkers(text) {
+    const room = text.match(SESSION_ROOM_MARKER_RE);
+    const save = text.match(SESSION_SAVE_MARKER_RE);
+    return { roomId: room ? room[1] : null, saveId: save ? save[1] : null };
   }
 
   // ---------- Filename validation and directory-handle file resolution ----------
@@ -970,18 +997,30 @@
     return { ok: true, filename: name };
   }
 
-  // Given a directory handle, a filename, and the current campaign's roomId,
-  // open the file inside the directory non-destructively and return whether
-  // the file was created (empty) or resumed (existing). Enforces the session-
-  // marker mismatch check: if the file already exists and has a different
-  // roomId marker, we refuse and surface a clear error to the caller.
+  // Given a directory handle, a filename, and the current campaign's roomId
+  // + saveId, open the file inside the directory non-destructively and
+  // return whether the file was created (empty) or resumed (existing).
+  //
+  // Mismatch logic — saveId is the stable per-campaign identifier; roomId
+  // rotates on every joinedRoom (so the same save typically gets a different
+  // roomId each session). Rules, in order:
+  //
+  //   1. File has saveId marker and we have a current saveId
+  //        → strict match; mismatch is a real cross-campaign error.
+  //   2. File has only a roomId marker (pre-v1.2.1, no saveId tracked yet)
+  //        → accept regardless of roomId match; flag needsMarkerMigration so
+  //          the caller can rewrite the header with both markers on its
+  //          next full write.
+  //   3. File has no session markers at all
+  //        → accept; flag needsMarkerMigration so we tag it going forward.
   //
   // Returns:
-  //   { ok: true,  fileHandle, created: false, existingContent, parsedTick }   // resumed
+  //   { ok: true,  fileHandle, created: false, existingContent, parsedTick,
+  //     needsMarkerMigration?: true }                                          // resumed
   //   { ok: true,  fileHandle, created: true,  existingContent: '' }            // new file
-  //   { ok: false, mismatch: true, fileRoomId, message }                        // session mismatch
+  //   { ok: false, mismatch: true, fileSaveId, message }                        // saveId mismatch
   //   { ok: false, message }                                                    // any other error
-  async function resolveFileHandle(directoryHandle, filename, expectedRoomId) {
+  async function resolveFileHandle(directoryHandle, filename, expectedRoomId, expectedSaveId) {
     if (!directoryHandle || typeof directoryHandle.getFileHandle !== 'function') {
       return { ok: false, message: 'Directory handle is invalid. Reconfigure live export.' };
     }
@@ -1012,20 +1051,56 @@
     } catch (e) {
       return { ok: false, message: `Couldn't read file in folder: ${e?.message || e?.name || 'unknown error'}.` };
     }
+    let needsMarkerMigration = false;
     if (text) {
-      const fileRoomId = parseSessionRoomId(text);
-      if (fileRoomId && expectedRoomId && fileRoomId !== expectedRoomId) {
-        return {
-          ok: false, mismatch: true, fileRoomId,
-          message: `That folder already has "${filename}" but it belongs to a different campaign. Pick a different folder or filename.`,
-        };
+      const { roomId: fileRoomId, saveId: fileSaveId } = parseSessionMarkers(text);
+      if (fileSaveId && expectedSaveId) {
+        if (fileSaveId !== expectedSaveId) {
+          return {
+            ok: false, mismatch: true, fileSaveId,
+            message: `That folder already has "${filename}" but it belongs to a different campaign. Pick a different folder or filename.`,
+          };
+        }
+        // saveId matches — file is current. Still migrate if roomId marker
+        // is stale (Voyage rotated rooms since the file was last touched).
+        if (expectedRoomId && fileRoomId && fileRoomId !== expectedRoomId) {
+          needsMarkerMigration = true;
+        }
+      } else if (!fileSaveId) {
+        // Legacy file (pre-v1.2.1) — no saveId to verify against. We
+        // deliberately don't reject on roomId mismatch here because Voyage
+        // rotates roomId per session, so the marker is usually stale. The
+        // caller migrates so future starts will use the strict saveId path.
+        needsMarkerMigration = true;
       }
+    } else {
+      // Empty file — treat as effectively new; let the caller add markers
+      // on initial write.
+      needsMarkerMigration = true;
     }
     const parsed = parseLastTickInFile(text);
     return {
       ok: true, fileHandle, created: false,
       existingContent: text, parsedTick: parsed.tick,
+      needsMarkerMigration: needsMarkerMigration || undefined,
     };
+  }
+
+  // Rewrite the session-marker line(s) at the top of an existing file's
+  // content. Strips every pre-existing voyage-session:* marker (anywhere
+  // in the file — defensively) and prepends fresh roomId/saveId markers
+  // based on the current snapshot. Returns the new content string.
+  //
+  // Pure: does not write to disk. Callers feed the result into writeToHandle
+  // when they're ready to commit (typically in startLiveExport, before any
+  // subsequent appends, so the file's tag matches the live state).
+  function migrateSessionMarkers(content, snap) {
+    const stripped = content.replace(SESSION_MARKER_LINE_RE, '');
+    const header = [];
+    if (snap?.roomId) header.push(`<!-- voyage-session:roomId=${snap.roomId} -->`);
+    if (snap?.session?.saveId) header.push(`<!-- voyage-session:saveId=${snap.session.saveId} -->`);
+    if (!header.length) return stripped;
+    return header.join('\n') + '\n' + stripped;
   }
 
   // NPC chat block markers — emitted by pushChat when live export is active.
@@ -1169,6 +1244,17 @@
     // stored handle from IDB and reuse it. If there's no stored config,
     // we have nothing to reuse — surface a clear "pick a folder first"
     // error instead of silently behaving like a fresh configure.
+    console.log('[voyage-story] STEP 4 — configureLiveExport(), directoryHandle param:', {
+      isNull: directoryHandle == null,
+      type: typeof directoryHandle,
+      constructor: directoryHandle?.constructor?.name,
+      kind: directoryHandle?.kind,
+      name: directoryHandle?.name,
+      hasGetFileHandle: typeof directoryHandle?.getFileHandle === 'function',
+      hasQueryPermission: typeof directoryHandle?.queryPermission === 'function',
+      ownKeys: directoryHandle ? Object.keys(directoryHandle) : null,
+      proto: directoryHandle ? Object.getPrototypeOf(directoryHandle)?.constructor?.name : null,
+    });
     let effectiveDir = directoryHandle;
     if (!effectiveDir) {
       const record = await loadRecord(snap.roomId);
@@ -1179,6 +1265,12 @@
       effectiveDir = record.directoryHandle;
       dbg(trace, 'rename-only: reusing stored handle', { folder: effectiveDir.name });
     } else if (typeof effectiveDir.getFileHandle !== 'function') {
+      console.log('[voyage-story] STEP 4 FAIL — handle has no getFileHandle. Prototype chain:', {
+        proto1: Object.getPrototypeOf(directoryHandle)?.constructor?.name,
+        proto2: Object.getPrototypeOf(Object.getPrototypeOf(directoryHandle))?.constructor?.name,
+        isPlainObject: Object.getPrototypeOf(directoryHandle) === Object.prototype,
+        JSON: JSON.stringify(directoryHandle),
+      });
       dbg(trace, 'abort', { reason: 'invalid directoryHandle' });
       return { ok: false, message: 'Invalid folder handle.' };
     }
@@ -1188,7 +1280,7 @@
       dbg(trace, 'abort', { reason: 'permission denied' });
       return { ok: false, message: 'Permission to read/write the folder was denied.' };
     }
-    const resolved = await resolveFileHandle(effectiveDir, filename, snap.roomId);
+    const resolved = await resolveFileHandle(effectiveDir, filename, snap.roomId, snap.session?.saveId);
     if (!resolved.ok) {
       dbg(trace, 'abort', { reason: 'resolve failed', message: resolved.message, mismatch: resolved.mismatch });
       return resolved;
@@ -1231,6 +1323,7 @@
     try { chrome.storage.local.remove(FILENAME_KEY_PREFIX + snap.roomId); }
     catch (e) { failures.push(`storage: ${e?.message || e?.name || 'unknown'}`); }
     if (storedHandleRoomId === snap.roomId) storedHandleRoomId = null;
+    pendingDirHandle = null;
     if (failures.length) {
       return { ok: false, message: `Couldn't fully clear configuration: ${failures.join('; ')}.` };
     }
@@ -1266,7 +1359,7 @@
       dbg(trace, 'abort', { reason: 'permission denied' });
       return { ok: false, message: 'permission denied' };
     }
-    const resolved = await resolveFileHandle(record.directoryHandle, record.filename, snap.roomId);
+    const resolved = await resolveFileHandle(record.directoryHandle, record.filename, snap.roomId, snap.session?.saveId);
     if (!resolved.ok) {
       dbg(trace, 'abort', { reason: 'resolve failed', message: resolved.message, mismatch: resolved.mismatch });
       setStatus(resolved.message);
@@ -1276,6 +1369,7 @@
       created: resolved.created,
       parsedTick: resolved.parsedTick,
       contentBytes: resolved.existingContent?.length || 0,
+      needsMarkerMigration: !!resolved.needsMarkerMigration,
     });
 
     liveExport = {
@@ -1302,11 +1396,26 @@
         : { ok: false, message: 'initial write failed' };
     }
 
-    // Existing file → preservation flow. Run cleanup, seed writtenChatState
-    // from file markers, then catch up new turns.
+    // Existing file → preservation flow. Migrate stale/missing session
+    // markers first (so the file's header reflects the current room+save
+    // before any subsequent append goes out), then run cleanup, seed
+    // writtenChatState from file markers, then catch up new turns.
+    let workingContent = resolved.existingContent;
+    if (resolved.needsMarkerMigration) {
+      workingContent = migrateSessionMarkers(workingContent, snap);
+      dbg(trace, 'migrated session markers', {
+        roomId: snap.roomId,
+        saveId: snap.session?.saveId || null,
+      });
+    }
     syncPhase = 'Cleaning up interrupted chats…';
-    const { content: cleaned, dirty } = await preSyncCleanupChatBlocks(resolved.existingContent, snap);
-    if (dirty) {
+    const { content: cleaned, dirty } = await preSyncCleanupChatBlocks(workingContent, snap);
+    // Write if cleanup changed anything, OR if we migrated markers (the
+    // markers live at the top of the file and appendToHandle never rewrites
+    // existing content, so a one-time full write is the only way to persist
+    // them).
+    const mustWrite = dirty || resolved.needsMarkerMigration;
+    if (mustWrite) {
       try {
         await writeToHandle(liveExport.handle, cleaned, 'startLiveExport:preSyncCleanup');
       } catch (e) {
@@ -2104,6 +2213,7 @@
       configFolderName,
       configFilename,
       suggestedFilename,
+      pendingDirName: pendingDirHandle?.name ?? null,
       syncPhase,
       syncCompleteMsg,
       lastStatus: lastStatusMessage,
@@ -2111,6 +2221,22 @@
       directoryPickerSupported: typeof window.showDirectoryPicker === 'function',
     };
   }
+
+  // Relay from the MAIN world: the popup triggers showDirectoryPicker via
+  // executeScript (MAIN world, beta.voyage.io origin) then postMessages the
+  // resulting handle to the isolated world. Same-origin postMessage preserves
+  // the handle's prototype methods unlike cross-origin IPC.
+  window.addEventListener('message', (e) => {
+    if (e.source !== window) return;
+    const m = e.data;
+    if (!m || m.source !== NAMESPACE || m.type !== 'pushPendingDir') return;
+    if (m.directoryHandle && typeof m.directoryHandle.getFileHandle === 'function') {
+      pendingDirHandle = m.directoryHandle;
+      console.log('[voyage-story] pendingDirHandle set:', m.dirName);
+    } else {
+      console.warn('[voyage-story] pushPendingDir: handle missing or invalid', m);
+    }
+  });
 
   chrome.runtime.onMessage.addListener((msg, _sender, sendResponse) => {
     if (!msg || msg.source !== NAMESPACE || !msg.action) return;
@@ -2132,6 +2258,20 @@
             return respond(await stopLiveExport());
           case 'clearConfig':
             return respond(await clearConfig());
+          case 'configureLiveExport': {
+            // Use pendingDirHandle (set by the MAIN-world postMessage relay)
+            // rather than msg.handle — FileSystemHandle is origin-locked and
+            // cannot survive chrome.tabs.sendMessage even with structured_clone.
+            const handle = pendingDirHandle || null;
+            console.log('[voyage-story] configureLiveExport — pendingDirHandle:', {
+              isNull: handle == null,
+              name: handle?.name,
+              hasGetFileHandle: typeof handle?.getFileHandle === 'function',
+            });
+            const result = await configureLiveExport(handle, msg.filename);
+            if (result.ok) pendingDirHandle = null;
+            return respond(result);
+          }
           default:
             return respond({ ok: false, message: 'unknown action: ' + msg.action });
         }
@@ -2144,13 +2284,6 @@
     return true; // async sendResponse
   });
 
-  // ---------- Cross-context bridge ----------
-  // chrome.tabs.sendMessage's serialization has been observed to drop the
-  // FileSystemFileHandle prototype methods, so a handle picked in the popup
-  // arrives in the content script with createWritable/getFile missing.
-  // The popup calls into the picker from inside this isolated world via
-  // chrome.scripting.executeScript so the handle is created and used in
-  // the same context — never crossing a structured-clone boundary.
   // Debug surface for live-console diagnostics. Call from the Voyage tab's
   // DevTools console — e.g. `__voyageStoryHelper.setDebug(true)` to enable
   // verbose logs, or `await __voyageStoryHelper.dumpState()` to inspect the
@@ -2203,11 +2336,6 @@
     try { console.log('[voyage-story] verbose debug logging', DEBUG_LOG ? 'enabled' : 'disabled'); } catch {}
     return DEBUG_LOG;
   }
-  // The popup's "Pick folder" button injects a function into this isolated
-  // world that calls `configureLiveExport(directoryHandle, filename)` after
-  // running `showDirectoryPicker`. The handle never crosses
-  // chrome.tabs.sendMessage (which strips its methods), so configuration
-  // happens entirely inside this script's context.
   window.__voyageStoryHelper = {
     configureLiveExport,
     clearConfig,
